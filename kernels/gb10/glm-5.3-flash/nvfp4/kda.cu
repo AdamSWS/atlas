@@ -455,6 +455,10 @@ extern "C" __global__ void __launch_bounds__(128) kda_commit_records(
 // grid kernel queues every block of every layer at once (4352 at 34 layers),
 // so a kernel or copy enqueued behind it on another stream waits for nearly
 // all of them; a grid of a few CTAs a SM leaves room beside the commit.
+// `delay_ns` (ATLAS_GLM_KDA_COMMIT_DELAY_US, 0 = none): each CTA sleeps that
+// long after it starts before it reads anything, so a commit issued at the
+// step boundary leaves the drafter's bandwidth-bound context append alone and
+// folds during the drafter's latency-bound layers. Same words either way.
 // Grid: (ctas, 1, 1); block 128.
 extern "C" __global__ void __launch_bounds__(128) kda_commit_records_stride(
     float* __restrict__ state,
@@ -464,9 +468,21 @@ extern "C" __global__ void __launch_bounds__(128) kda_commit_records_stride(
     unsigned long long record_stride,
     unsigned int rows,
     unsigned int heads,
-    unsigned int layers
+    unsigned int layers,
+    unsigned long long delay_ns
 ) {
     atlas_pdl_enter();
+    if (delay_ns != 0) {
+        if (threadIdx.x == 0) {
+            unsigned long long t0, t;
+            asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+            do {
+                __nanosleep(4000);
+                asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
+            } while (t - t0 < delay_ns);
+        }
+        __syncthreads();
+    }
     const unsigned int per_layer = heads * KDA_COMMIT_KSPLIT;
     for (unsigned int item = blockIdx.x; item < per_layer * layers; item += gridDim.x)
         kda_commit_records_item(state, state_layer_stride, records, records_layer_stride,

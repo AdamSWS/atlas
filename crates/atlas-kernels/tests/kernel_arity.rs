@@ -39,6 +39,10 @@ const PINS: &[(&str, &str, usize)] = &[
     ("w4a16_v3", "w4a16_gemm_t_m128_v3", 8),
     // Load-time transpose (quantized.rs GPU path) — 4-arg launch.
     ("transpose_u8", "transpose_u8", 4),
+    // KDA records commit (`ops::kda_commit_records`): the fixed-grid twin
+    // takes the layer count and the start delay past the grid kernel's 7.
+    ("kda", "kda_commit_records", 7),
+    ("kda", "kda_commit_records_stride", 9),
 ];
 
 /// Targets whose copy of a kernel legitimately differs in arity from the

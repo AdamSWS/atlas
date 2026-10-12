@@ -379,6 +379,7 @@ impl TransformerModel {
     ) -> Result<()> {
         use crate::layer::SsmLayerState;
         let ctas = ops::kda_commit_ctas()?;
+        let delay_us = ops::kda_commit_delay_us()?;
         let kernel = ops::kda_commit_kernel(self.gpu.as_ref(), ctas)?;
         let heads = self.ssm_pool.h_bytes / (128 * 128 * 4);
         let conv_bytes = self.config.ssm_conv_state_bytes();
@@ -435,6 +436,7 @@ impl TransformerModel {
                 heads as u32,
                 layers as u32,
                 ctas,
+                delay_us,
                 stream,
             )
         };

@@ -187,6 +187,16 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
         Ok(ops::kda_commit_ctas()? as u64)
     }),
+    // Same words either way, like the grid above. Only the fixed grid
+    // sleeps, so a delay without it is refused at boot.
+    ("ATLAS_GLM_KDA_COMMIT_DELAY_US", || {
+        let (ctas, delay) = (ops::kda_commit_ctas()?, ops::kda_commit_delay_us()?);
+        ensure!(
+            ctas != 0 || delay == 0,
+            "ATLAS_GLM_KDA_COMMIT_DELAY_US={delay} needs ATLAS_GLM_KDA_COMMIT_CTAS > 0"
+        );
+        Ok(delay as u64)
+    }),
     ("ATLAS_MOE_SHARED_REDUCE_OVERLAP", || {
         Ok(moe::shared_reduce_overlap_requested() as u64)
     }),

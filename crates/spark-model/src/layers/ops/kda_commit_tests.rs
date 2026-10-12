@@ -113,6 +113,7 @@ struct Dev<'a> {
     kernel: spark_runtime::gpu::KernelHandle,
     /// 0: the grid kernel; else the stride kernel over this many CTAs.
     ctas: u32,
+    delay_us: u32,
     stream: u64,
     state: DevicePtr,
     records: DevicePtr,
@@ -136,6 +137,7 @@ impl Dev<'_> {
                 HEADS as u32,
                 layers as u32,
                 self.ctas,
+                self.delay_us,
                 self.stream,
             )
             .unwrap()
@@ -174,20 +176,22 @@ fn kda_commit_layer_batched_byte_identical() {
     }
     let want: Vec<u32> = want.iter().map(|x| x.to_bits()).collect();
     // The stride kernel over 1, 7, 48 and more CTAs than blocks: every
-    // block-to-CTA phase.
-    for (ctas, batched) in [
-        (0, true),
-        (0, false),
-        (1, true),
-        (7, true),
-        (48, true),
-        (9999, true),
+    // block-to-CTA phase; and 48 CTAs that first sleep 200 us.
+    for (ctas, batched, delay_us) in [
+        (0, true, 0),
+        (0, false, 0),
+        (1, true, 0),
+        (7, true, 0),
+        (48, true, 0),
+        (9999, true, 0),
+        (48, true, 200),
     ] {
         let (state, records) = setup(g, &p);
         let dev = Dev {
             g,
             kernel: ops::kda_commit_kernel(g, ctas).unwrap(),
             ctas,
+            delay_us,
             stream: g.default_stream(),
             state,
             records,
@@ -201,7 +205,7 @@ fn kda_commit_layer_batched_byte_identical() {
         let bad = got.iter().zip(&want).filter(|(a, b)| a != b).count();
         assert_eq!(
             bad, 0,
-            "ctas={ctas} batched={batched}: {bad} state words differ"
+            "ctas={ctas} batched={batched} delay={delay_us}: {bad} state words differ"
         );
         g.free(state).unwrap();
         g.free(records).unwrap();
@@ -219,6 +223,7 @@ fn kda_commit_layer_batched_timing() {
         g,
         kernel: ops::kda_commit_kernel(g, 0).unwrap(),
         ctas: 0,
+        delay_us: 0,
         stream: g.default_stream(),
         state,
         records,
@@ -278,6 +283,7 @@ fn kda_commit_beside_a_copy_timing() {
             g,
             kernel: ops::kda_commit_kernel(g, ctas).unwrap(),
             ctas,
+            delay_us: 0,
             stream: side,
             state,
             records,

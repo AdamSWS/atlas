@@ -173,6 +173,31 @@ pub fn kda_commit_ctas() -> Result<u32> {
     .map_err(anyhow::Error::msg)
 }
 
+/// `ATLAS_GLM_KDA_COMMIT_DELAY_US`: how long each CTA of the fixed-grid
+/// commit (`ATLAS_GLM_KDA_COMMIT_CTAS` > 0) sleeps after it starts, in
+/// `0..=5000` us (unset or `0` = none). Moves the commit's reads and writes
+/// off the start of the drafter's propose; the folded words are the same.
+/// Read once.
+pub fn kda_commit_delay_us() -> Result<u32> {
+    static DELAY: std::sync::OnceLock<std::result::Result<u32, String>> =
+        std::sync::OnceLock::new();
+    DELAY
+        .get_or_init(
+            || match std::env::var("ATLAS_GLM_KDA_COMMIT_DELAY_US").as_deref() {
+                Err(_) => Ok(0),
+                Ok(value) => value
+                    .parse::<u32>()
+                    .ok()
+                    .filter(|&us| us <= 5000)
+                    .ok_or_else(|| {
+                        format!("ATLAS_GLM_KDA_COMMIT_DELAY_US requires 0..=5000, got {value:?}")
+                    }),
+            },
+        )
+        .clone()
+        .map_err(anyhow::Error::msg)
+}
+
 /// The commit kernel for [`kda_commit_ctas`] CTAs.
 pub fn kda_commit_kernel(gpu: &dyn GpuBackend, ctas: u32) -> Result<KernelHandle> {
     let name = match ctas {
@@ -189,7 +214,8 @@ pub fn kda_commit_kernel(gpu: &dyn GpuBackend, ctas: u32) -> Result<KernelHandle
 /// bit-identical to the state that verify reached at that row. One launch
 /// for every layer; a single layer passes `layers == 1` (strides unused).
 /// `kernel` is [`kda_commit_kernel`]`(ctas)`: the full grid at `ctas == 0`,
-/// else `ctas` CTAs striding over it.
+/// else `ctas` CTAs striding over it, each first sleeping `delay_us`
+/// (`kda_commit_delay_us`; the full grid takes none).
 #[allow(clippy::too_many_arguments)]
 pub fn kda_commit_records(
     gpu: &dyn GpuBackend,
@@ -203,8 +229,13 @@ pub fn kda_commit_records(
     heads: u32,
     layers: u32,
     ctas: u32,
+    delay_us: u32,
     stream: u64,
 ) -> Result<()> {
+    anyhow::ensure!(
+        ctas != 0 || delay_us == 0,
+        "a delayed KDA commit needs the fixed grid (ATLAS_GLM_KDA_COMMIT_CTAS > 0)"
+    );
     let grid = match ctas {
         0 => [heads * KDA_COMMIT_KSPLIT, layers, 1],
         _ => [ctas.min(heads * KDA_COMMIT_KSPLIT * layers), 1, 1],
@@ -221,7 +252,10 @@ pub fn kda_commit_records(
         .arg_u32(heads);
     match ctas {
         0 => launch.launch(stream),
-        _ => launch.arg_u32(layers).launch(stream),
+        _ => launch
+            .arg_u32(layers)
+            .arg_u64(u64::from(delay_us) * 1000)
+            .launch(stream),
     }
 }
 
