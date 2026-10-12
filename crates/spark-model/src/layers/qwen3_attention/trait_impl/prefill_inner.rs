@@ -599,7 +599,7 @@ impl Qwen3AttentionLayer {
 
         // ── Attention sublayer ──
         // ATLAS_GLM_HC_SEAM_FUSE: the pre and the input norm in one launch.
-        let attn_norm_fused = self.glm_seam_norm_fused(
+        let attn_plan = self.glm_seam_norm_plan(
             hc,
             &hc.attn,
             None,
@@ -608,9 +608,13 @@ impl Qwen3AttentionLayer {
             ctx.buffers.norm_output(),
             n,
             sp.is_none() && !diag_this,
+            false,
             ctx,
-            stream,
         )?;
+        if let Some(plan) = &attn_plan {
+            plan.launch(ctx.gpu, None, stream)?;
+        }
+        let attn_norm_fused = attn_plan.is_some();
         if !attn_norm_fused {
             self.hc_pre_prefill_site(&hc.attn, hc, hidden, n, ctx, stream)?;
         }
@@ -715,13 +719,37 @@ impl Qwen3AttentionLayer {
         };
 
         det.tap("attn", attn_out, (0, num_tokens), h * 2);
+        // ATLAS_GLM_HC_SEAM_FUSE: this site's post, the FFN site's pre and the
+        // post-attention norm in one launch. With ATLAS_GLM_HC_SEAM_AR_FOLD it
+        // also lands the all-reduce of `attn_out`, when nothing between reads
+        // it (no det trace, no post-attention-output norm, no swap offload).
+        let ffn_plan = self.glm_seam_norm_plan(
+            hc,
+            &hc.ffn,
+            Some(attn_out),
+            hidden,
+            &self.post_attn_norm,
+            ctx.buffers.norm_output(),
+            n,
+            sp.is_none() && !diag_this && !self.ffn.is_none(),
+            !crate::det_trace::on()
+                && self.post_attn_out_norm.is_none()
+                && !self.high_speed_swap_engaged(kv_cache),
+            ctx,
+        )?;
+        let mut landing = None;
         if let Some(sp) = sp {
             sp.reduce_scatter(attn_out, h, ctx, stream)?;
         } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
             let bytes = num_tokens * h * 2;
-            comm.all_reduce_async(attn_out.0, bytes, stream)?;
+            if ffn_plan.as_ref().is_some_and(|plan| plan.lands()) {
+                landing = comm.all_reduce_send_async(attn_out.0, bytes, stream)?;
+            }
+            if landing.is_none() {
+                comm.all_reduce_async(attn_out.0, bytes, stream)?;
+            }
         }
         det.tap("attn_red", local(attn_out), det_rows, h * 2);
 
@@ -799,20 +827,10 @@ impl Qwen3AttentionLayer {
             return Ok(());
         }
 
-        // ATLAS_GLM_HC_SEAM_FUSE: this site's post, the FFN site's pre and the
-        // post-attention norm in one launch.
-        let ffn_norm_fused = self.glm_seam_norm_fused(
-            hc,
-            &hc.ffn,
-            Some(attn_out),
-            hidden,
-            &self.post_attn_norm,
-            ctx.buffers.norm_output(),
-            n,
-            sp.is_none() && !diag_this,
-            ctx,
-            stream,
-        )?;
+        if let Some(plan) = &ffn_plan {
+            plan.launch(ctx.gpu, landing, stream)?;
+        }
+        let ffn_norm_fused = ffn_plan.is_some();
         let seam = ffn_norm_fused
             || self.hc_post_pre_prefill_seam(
                 hc,

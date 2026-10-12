@@ -116,6 +116,22 @@ impl NcclBackend {
         Ok(false)
     }
 
+    /// [`Self::try_oneshot`] of an in-place all-reduce whose landing the next
+    /// kernel on `stream` does (`OneShot::enqueue_send`).
+    pub(super) fn try_oneshot_send(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<Option<crate::ArLanding>> {
+        #[cfg(atlas_rdma_verbs)]
+        if let Some(oneshot) = self.rdma.as_ref().and_then(|r| r.oneshot()) {
+            return oneshot.enqueue_send(ptr, bytes, stream);
+        }
+        let _ = (ptr, bytes, stream);
+        Ok(None)
+    }
+
     /// Largest one-shot payload (0 when the channel is unavailable).
     pub(super) fn oneshot_max_bytes(&self) -> usize {
         #[cfg(atlas_rdma_verbs)]

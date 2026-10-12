@@ -187,6 +187,15 @@ impl CommBackend for NcclBackend {
         self.try_rdma_exchange(send, dst, bytes, add, compute_stream)
     }
 
+    fn all_reduce_send_async(
+        &self,
+        ptr: u64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<Option<crate::ArLanding>> {
+        self.try_oneshot_send(ptr, bytes, stream)
+    }
+
     fn all_reduce_capturable(&self, ptr: u64, bytes: usize, stream: u64) -> Result<bool> {
         self.try_oneshot(ptr, ptr, bytes, true, stream)
     }

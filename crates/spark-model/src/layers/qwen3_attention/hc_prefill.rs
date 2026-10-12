@@ -176,11 +176,12 @@ pub(crate) struct SeamNorm<'a> {
 
 /// The decode seam ([`hc_post_pre_prefill_fused`] at <= 32 rows) and the
 /// caller's RMS norm of `hidden` as one launch (`ATLAS_GLM_HC_SEAM_FUSE=1`,
-/// [`ops::glm_decode_fuse::hc_seam_fused`]). Returns false (nothing
-/// launched) when it does not apply; the caller then runs the seam and its
-/// norm as before.
+/// [`ops::glm_decode_fuse::plan`]), when it applies; the caller then runs
+/// [`ops::glm_decode_fuse::SeamPlan::launch`] where the seam was, and skips
+/// the seam and its norm. `fold`: see `plan` (the caller would all-reduce
+/// `block_out` with the send-only one-shot op).
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn hc_seam_norm_fused(
+pub(crate) fn hc_seam_norm_plan(
     next: &HcSiteWeights,
     block_out: Option<DevicePtr>,
     hidden: DevicePtr,
@@ -189,14 +190,14 @@ pub(crate) fn hc_seam_norm_fused(
     hc_mult: u32,
     sinkhorn_iters: u32,
     hc_eps: f32,
+    fold: bool,
     ctx: &ForwardContext,
-    stream: u64,
-) -> Result<bool> {
+) -> Result<Option<ops::glm_decode_fuse::SeamPlan>> {
     if !seam_flags().1 || !seam_shape_fits(hc_mult, tokens, ctx) {
-        return Ok(false);
+        return Ok(None);
     }
     let eps = ctx.config.rms_norm_eps as f32;
-    ops::glm_decode_fuse::hc_seam_fused(
+    ops::glm_decode_fuse::plan(
         ctx.gpu,
         &ctx.config.model_type,
         &ops::glm_decode_fuse::SeamFuse {
@@ -218,8 +219,42 @@ pub(crate) fn hc_seam_norm_fused(
             hc_eps,
             rms_eps: eps,
         },
-        stream,
+        fold,
     )
+}
+
+/// [`hc_seam_norm_plan`] launched at once (no all-reduce fold). Returns false
+/// (nothing launched) when it does not apply; the caller then runs the seam
+/// and its norm as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hc_seam_norm_fused(
+    next: &HcSiteWeights,
+    block_out: Option<DevicePtr>,
+    hidden: DevicePtr,
+    norm: &SeamNorm,
+    tokens: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    hc_eps: f32,
+    ctx: &ForwardContext,
+    stream: u64,
+) -> Result<bool> {
+    let plan = hc_seam_norm_plan(
+        next,
+        block_out,
+        hidden,
+        norm,
+        tokens,
+        hc_mult,
+        sinkhorn_iters,
+        hc_eps,
+        false,
+        ctx,
+    )?;
+    match plan {
+        Some(plan) => plan.launch(ctx.gpu, None, stream).map(|()| true),
+        None => Ok(false),
+    }
 }
 
 /// GLM HC4 seam: the finishing site's `hc_post` of `block_out` fused with

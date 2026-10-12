@@ -8,7 +8,9 @@
 // send it to the peer followed by one flag per rail. Then: wait until every
 // rail's flag from the peer reaches this op, and land the peer payload in
 // `dst` -- an in-place add bit-identical to bf16_add_inplace
-// (dst = __hadd(dst, peer)) or a copy.
+// (dst = __hadd(dst, peer)) or a copy. With add == ONESHOT_SEND_ONLY the
+// kernel stops after the publish: its stream successor waits, lands the peer
+// payload itself and advances the sequence (rdma_oneshot_proto.cuh).
 //
 // The op sequence number lives in device memory (`state[0]`), so eager
 // launches and CUDA-graph replays share one sequence: every block reads
@@ -58,105 +60,14 @@
 // carries no license, so nothing of it is reproduced here).
 
 #include "atlas_pdl.cuh"
-#include <cuda_bf16.h>
-#include <stdint.h>
-
-#define ONESHOT_POISON_DESYNC (1ull << 61)
-#define ONESHOT_POISON_TIMEOUT (1ull << 62)
-#define ONESHOT_POISON_MISMATCH (1ull << 63)
-#define ONESHOT_FLAG_STRIDE 8 // u64 words: one 64-byte line per rail
-#define ONESHOT_UNROLL 4       // receive loads in flight per thread
-
-__device__ __forceinline__ uint64_t oneshot_ld_acquire(const uint64_t* p) {
-    uint64_t v;
-    asm volatile("ld.acquire.sys.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
-    return v;
-}
-
-__device__ __forceinline__ uint64_t oneshot_ld_acquire_gpu(const uint64_t* p) {
-    uint64_t v;
-    asm volatile("ld.acquire.gpu.global.u64 %0, [%1];" : "=l"(v) : "l"(p) : "memory");
-    return v;
-}
-
-// Receive-slot loads: system-scope (never the non-coherent path), and without
-// a memory clobber so a thread keeps several in flight.
-__device__ __forceinline__ uint4 oneshot_ld_v4(const uint4* p) {
-    uint4 v;
-    asm volatile("ld.relaxed.sys.global.v4.u32 {%0, %1, %2, %3}, [%4];"
-                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w)
-                 : "l"(p));
-    return v;
-}
-
-__device__ __forceinline__ unsigned short oneshot_ld_u16(const unsigned short* p) {
-    unsigned short v;
-    asm volatile("ld.relaxed.sys.global.u16 %0, [%1];" : "=h"(v) : "l"(p));
-    return v;
-}
-
-__device__ __forceinline__ uint32_t oneshot_ld_acquire_u32(const uint32_t* p) {
-    uint32_t v;
-    asm volatile("ld.acquire.sys.global.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
-    return v;
-}
-
-// Staging stores into pinned host memory read by the NIC: write-through
-// (mode 1) or plain (mode 2).
-__device__ __forceinline__ void oneshot_st_v4(uint4* p, uint4 v, uint32_t mode) {
-    if (mode == 1) {
-        asm volatile("st.global.wt.v4.u32 [%0], {%1, %2, %3, %4};"
-                     ::"l"(p), "r"(v.x), "r"(v.y), "r"(v.z), "r"(v.w) : "memory");
-    } else {
-        *p = v;
-    }
-}
-
-__device__ __forceinline__ void oneshot_st_u16(unsigned short* p, unsigned short v, uint32_t mode) {
-    if (mode == 1) {
-        asm volatile("st.global.wt.u16 [%0], %1;" ::"l"(p), "h"(v) : "memory");
-    } else {
-        *p = v;
-    }
-}
-
-__device__ __forceinline__ uint64_t oneshot_now() {
-    uint64_t t;
-    asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
-    return t;
-}
-
-__device__ __forceinline__ void oneshot_poison(uint64_t* poison, uint64_t word) {
-    *(volatile uint64_t*)poison = word;
-    __threadfence_system();
-    __trap();
-}
-
-// Whether every rail's flag has reached `seq` (poisons on a size mismatch or
-// a flag from beyond the next op).
-__device__ __forceinline__ bool oneshot_arrived(
-    const uint64_t* flags, uint32_t rails, uint64_t seq, uint32_t bytes, uint64_t* poison) {
-    for (uint32_t r = 0; r < rails; ++r) {
-        const uint64_t f = oneshot_ld_acquire(flags + r * ONESHOT_FLAG_STRIDE);
-        if ((f >> 24) < seq) {
-            return false;
-        }
-        if ((f >> 24) == seq && (f & 0xffffff) != bytes) {
-            oneshot_poison(poison, ONESHOT_POISON_MISMATCH | seq);
-        }
-        if ((f >> 24) > seq + 1) {
-            oneshot_poison(poison, ONESHOT_POISON_DESYNC | seq);
-        }
-    }
-    return true;
-}
+#include "rdma_oneshot_proto.cuh"
 
 extern "C" __global__ void rdma_oneshot_bf16(
     __nv_bfloat16* dst,         // may alias src (in place)
     const unsigned char* recv,  // receive slot 0; slot 1 is slot_stride bytes on
     uint64_t slot_stride,
     uint32_t bytes,
-    uint32_t add,
+    uint32_t add,               // 0 copy, 1 add, ONESHOT_SEND_ONLY: no landing
     const uint64_t* flags,      // one per rail, ONESHOT_FLAG_STRIDE words apart
     uint32_t rails,
     uint64_t* state,            // device: [0] seq, [1] finished blocks (u32), [2] go,
@@ -169,7 +80,6 @@ extern "C" __global__ void rdma_oneshot_bf16(
     uint32_t sm_stage           // 0: S already staged; 1: stage, write-through; 2: plain
 ) {
     atlas_pdl_enter();
-    uint64_t* go = state + 2;
     const uint64_t seq = *(volatile uint64_t*)state + 1;
     const uint32_t n = bytes / 2;
     const uint32_t tid = blockIdx.x * blockDim.x + threadIdx.x;
@@ -242,25 +152,14 @@ extern "C" __global__ void rdma_oneshot_bf16(
         if (blockIdx.x == 0 && oneshot_ld_acquire(poison) != 0) {
             __trap();
         }
-        const uint64_t t0 = oneshot_now();
-        for (uint32_t spin = 0;; ++spin) {
-            const bool own = blockIdx.x == 0 || spin % 256 == 255;
-            if (own ? oneshot_arrived(flags, rails, seq, bytes, poison)
-                    : oneshot_ld_acquire_gpu(go) >= seq) {
-                break;
-            }
-            if (spin % 64 == 63) {
-                if (blockIdx.x == 0 && oneshot_ld_acquire(poison) != 0) {
-                    __trap();
-                }
-                if (timeout_ns != 0 && oneshot_now() - t0 > timeout_ns) {
-                    oneshot_poison(poison, ONESHOT_POISON_TIMEOUT | seq);
-                }
-            }
+        if (add != ONESHOT_SEND_ONLY) {
+            oneshot_land_wait(flags, rails, state, seq, bytes, poison, timeout_ns, blockIdx.x == 0,
+                              gridDim.x > 1);
         }
-        if (blockIdx.x == 0 && gridDim.x > 1) {
-            asm volatile("st.release.gpu.global.u64 [%0], %1;" ::"l"(go), "l"(seq) : "memory");
-        }
+    }
+    // Send only: the consumer kernel waits, lands and advances the sequence.
+    if (add == ONESHOT_SEND_ONLY) {
+        return;
     }
     __syncthreads();
 
@@ -303,11 +202,6 @@ extern "C" __global__ void rdma_oneshot_bf16(
 
     __syncthreads();
     if (threadIdx.x == 0) {
-        uint32_t* done = reinterpret_cast<uint32_t*>(state + 1);
-        __threadfence();
-        if (atomicAdd(done, 1u) == gridDim.x - 1) {
-            *done = 0;
-            *(volatile uint64_t*)state = seq;
-        }
+        oneshot_land_done(state, seq, gridDim.x);
     }
 }

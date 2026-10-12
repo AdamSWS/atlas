@@ -67,11 +67,11 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
-    /// [`super::super::hc_seam_norm_fused`] for a GLM site of this layer and
+    /// [`super::super::hc_seam_norm_plan`] for a GLM site of this layer and
     /// its block-input RMS norm `weight` (into `normed`), when `eligible`
-    /// (no sequence-parallel rows, no diagnostics). Whether it launched.
+    /// (no sequence-parallel rows, no diagnostics); `fold` as there.
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn glm_seam_norm_fused(
+    pub(super) fn glm_seam_norm_plan(
         &self,
         hc: &HcWeights,
         site: &HcSiteWeights,
@@ -81,28 +81,31 @@ impl Qwen3AttentionLayer {
         normed: DevicePtr,
         n: u32,
         eligible: bool,
+        fold: bool,
         ctx: &ForwardContext,
-        stream: u64,
-    ) -> Result<bool> {
-        Ok(eligible
+    ) -> Result<Option<ops::glm_decode_fuse::SeamPlan>> {
+        if !(eligible
             && ctx.config.model_type == "glm5_next"
-            && ops::HcVariant::of(hc).applies_block_input_norm()
-            && super::super::hc_seam_norm_fused(
-                site,
-                block_out,
-                hidden,
-                &super::super::SeamNorm {
-                    kernel: self.rms_norm_w_k,
-                    weight,
-                    out: normed,
-                },
-                n,
-                hc.hc_mult as u32,
-                hc.sinkhorn_iters as u32,
-                hc.hc_eps,
-                ctx,
-                stream,
-            )?)
+            && ops::HcVariant::of(hc).applies_block_input_norm())
+        {
+            return Ok(None);
+        }
+        super::super::hc_seam_norm_plan(
+            site,
+            block_out,
+            hidden,
+            &super::super::SeamNorm {
+                kernel: self.rms_norm_w_k,
+                weight,
+                out: normed,
+            },
+            n,
+            hc.hc_mult as u32,
+            hc.sinkhorn_iters as u32,
+            hc.hc_eps,
+            fold,
+            ctx,
+        )
     }
 
     /// Whether the attention site's post ran fused with the FFN site's

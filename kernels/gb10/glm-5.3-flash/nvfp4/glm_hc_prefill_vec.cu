@@ -4,6 +4,7 @@
 // only the independent 4x4 Sinkhorn cells distributed across 16 lanes.
 #include "../../common/atlas_pdl.cuh"
 #include "atlas_pdl_touch.cuh"
+#include "../../common/rdma_oneshot_proto.cuh"
 #include <cuda_bf16.h>
 
 #ifndef HC_BLOCK
@@ -942,13 +943,17 @@ __device__ __forceinline__ float glm_hcd_bf(const __nv_bfloat16* p) {
 }
 
 // Rows t0 .. t0 + R - 1 of glm_hc_decode_partial_rows_t (grid, block and
-// partial layout unchanged); `fn` is the BF16 [24, 16384] mix weight.
-template <bool POST, unsigned R>
+// partial layout unchanged); `fn` is the BF16 [24, 16384] mix weight. LAND
+// (the fused seam's all-reduce fold): the block output is this rank's half,
+// and the other half is `peer` (a one-shot receive slot, read at system
+// scope); each element is their __hadd, rdma_oneshot_bf16's landing.
+template <bool POST, unsigned R, bool LAND = false>
 __device__ __forceinline__ void glm_hc_decode_partial_ilp_t(
     const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
     const float* __restrict__ post, const float* __restrict__ comb,
     const unsigned short* __restrict__ fn, float* __restrict__ partial,
-    const unsigned int tokens, const unsigned int t0
+    const unsigned int tokens, const unsigned int t0,
+    [[maybe_unused]] const unsigned short* peer = nullptr
 ) {
     constexpr unsigned int H = 4096, K = 4 * H, M = 24, N = R * (M + 1);
     __shared__ float s_red[GLM_HCD_TG][4][M + 1];
@@ -974,7 +979,14 @@ __device__ __forceinline__ void glm_hc_decode_partial_ilp_t(
             for (unsigned int i = 0; i < 4; ++i) c[j][i] = comb[t * 16 + i * 4 + st];
             #pragma unroll
             for (unsigned int e = 0; e < 2; ++e) {
-                o[j][e] = glm_hcd_bf(block_out + t * H + d + e * 32);
+                if constexpr (LAND) {
+                    const __nv_bfloat16 sum = __hadd(
+                        block_out[t * H + d + e * 32],
+                        __ushort_as_bfloat16(oneshot_ld_u16(peer + t * H + d + e * 32)));
+                    o[j][e] = glm_hcd_bf(&sum);
+                } else {
+                    o[j][e] = glm_hcd_bf(block_out + t * H + d + e * 32);
+                }
                 #pragma unroll
                 for (unsigned int i = 0; i < 4; ++i) x[j][i][e] = glm_hcd_bf(streams + t * K + i * H + d + e * 32);
             }
@@ -1030,19 +1042,20 @@ __device__ __forceinline__ void glm_hc_decode_partial_ilp_t(
     }
 }
 
-template <bool POST>
+template <bool POST, bool LAND = false>
 __device__ __forceinline__ void glm_hc_decode_partial_ilp(
     const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
     const float* __restrict__ post, const float* __restrict__ comb,
-    const unsigned char* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens
+    const unsigned char* __restrict__ hc_fn, float* __restrict__ partial, const unsigned int tokens,
+    const unsigned short* peer = nullptr
 ) {
     const unsigned int t0 = blockIdx.y * GLM_HCD_TG, rows = min(tokens, t0 + GLM_HCD_TG) - t0;
     const unsigned short* fn = reinterpret_cast<const unsigned short*>(hc_fn);
     switch (rows) {
-    case 1: glm_hc_decode_partial_ilp_t<POST, 1>(block_out, streams, post, comb, fn, partial, tokens, t0); break;
-    case 2: glm_hc_decode_partial_ilp_t<POST, 2>(block_out, streams, post, comb, fn, partial, tokens, t0); break;
-    case 3: glm_hc_decode_partial_ilp_t<POST, 3>(block_out, streams, post, comb, fn, partial, tokens, t0); break;
-    default: glm_hc_decode_partial_ilp_t<POST, 4>(block_out, streams, post, comb, fn, partial, tokens, t0); break;
+    case 1: glm_hc_decode_partial_ilp_t<POST, 1, LAND>(block_out, streams, post, comb, fn, partial, tokens, t0, peer); break;
+    case 2: glm_hc_decode_partial_ilp_t<POST, 2, LAND>(block_out, streams, post, comb, fn, partial, tokens, t0, peer); break;
+    case 3: glm_hc_decode_partial_ilp_t<POST, 3, LAND>(block_out, streams, post, comb, fn, partial, tokens, t0, peer); break;
+    default: glm_hc_decode_partial_ilp_t<POST, 4, LAND>(block_out, streams, post, comb, fn, partial, tokens, t0, peer); break;
     }
 }
 
@@ -1161,7 +1174,20 @@ __device__ __forceinline__ unsigned int glm_hcs_pack(float v0, float v1) {
 #define GLM_HCS_PAIRS 2048                        // 4096 / 2
 #define GLM_HCS_PAIRS_PER ((GLM_HCS_PAIRS + GLM_HCS_NORM_THREADS - 1) / GLM_HCS_NORM_THREADS)
 
-template <bool POST>
+// The all-reduce fold's receive side (LAND): the send-only one-shot op the
+// stream ran before this kernel (rdma_oneshot_bf16, add == ONESHOT_SEND_ONLY).
+struct GlmHcsLand {
+    const unsigned char* recv;  // receive slot 0; slot 1 is slot_stride bytes on
+    unsigned long long slot_stride;
+    const uint64_t* flags;
+    unsigned int rails;
+    uint64_t* state;
+    uint64_t* poison;
+    unsigned long long timeout_ns;
+    unsigned int bytes;
+};
+
+template <bool POST, bool LAND = false>
 __device__ __forceinline__ void glm_hc_seam_fused_t(
     const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
     float* post, float* comb, const unsigned char* __restrict__ hc_fn, float* __restrict__ partial,
@@ -1169,14 +1195,34 @@ __device__ __forceinline__ void glm_hc_seam_fused_t(
     const float* __restrict__ hc_base, __nv_bfloat16* __restrict__ y_out,
     const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ norm_out,
     const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps,
-    const float hc_eps, const float rms_eps
+    const float hc_eps, const float rms_eps, [[maybe_unused]] const GlmHcsLand land = {}
 ) {
     constexpr unsigned int H = 4096;
     const unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
     const unsigned int t0 = blockIdx.y * GLM_HCD_TG, rows = min(tokens, t0 + GLM_HCD_TG) - t0;
+    // LAND: rdma_oneshot_bf16's wait, here: thread 0 of CTA (0, 0) polls the
+    // peer's flags and republishes the op on the go word, the others poll it.
+    // `block_out` is this rank's half; phase 1 adds the peer's half from the
+    // receive slot as rdma_oneshot_bf16 would have in place.
+    [[maybe_unused]] __shared__ unsigned long long s_seq;
+    const unsigned short* peer = nullptr;
+    if constexpr (LAND) {
+        if (tid == 0) {
+            const uint64_t seq = *(volatile uint64_t*)land.state + 1;
+            const bool poller = blockIdx.x == 0 && blockIdx.y == 0;
+            if (poller && oneshot_ld_acquire(land.poison) != 0) {
+                __trap();
+            }
+            oneshot_land_wait(land.flags, land.rails, land.state, seq, land.bytes, land.poison,
+                              land.timeout_ns, poller, gridDim.x * gridDim.y > 1);
+            s_seq = seq;
+        }
+        __syncthreads();
+        peer = reinterpret_cast<const unsigned short*>(land.recv + (s_seq & 1) * land.slot_stride);
+    }
     // Phase 1, every CTA: the ILP partial of the row group, columns
     // blockIdx.x * 64 .. (the ILP kernel's body: the group shares hc_fn).
-    glm_hc_decode_partial_ilp<POST>(block_out, streams, post, comb, hc_fn, partial, tokens);
+    glm_hc_decode_partial_ilp<POST, LAND>(block_out, streams, post, comb, hc_fn, partial, tokens, peer);
     // Count in. The barrier orders every thread's stores before thread 0's
     // fence and atomic (a cumulative release, as cooperative groups' grid
     // sync). The group's counter only grows, by GLM_HCD_SPLIT a launch (2^32
@@ -1188,6 +1234,10 @@ __device__ __forceinline__ void glm_hc_seam_fused_t(
     __shared__ unsigned int s_go;
     __syncthreads();
     if (tid == 0) {
+        if constexpr (LAND) {
+            // Every thread of this CTA is past its receive-slot loads.
+            oneshot_land_done(land.state, s_seq, gridDim.x * gridDim.y);
+        }
         __threadfence();
         unsigned int* counter = counters + blockIdx.y * GLM_HCS_COUNTER_STRIDE;
         const unsigned int old = atomicAdd(counter, 1u);
@@ -1355,4 +1405,24 @@ extern "C" __global__ void __launch_bounds__(128) glm_hc_seam_fused_bf16(
     atlas_pdl_enter_touch({hc_fn, 8192u, 8192ull}, {hc_fn, 0u, 0ull}, 96u,
                           blockIdx.y == 0u ? blockIdx.x : (unsigned)GLM_HCD_SPLIT, (unsigned)GLM_HCD_SPLIT);
     glm_hc_seam_fused_t<false>(GLM_HC_SEAM_FUSED_CALL);
+}
+
+// ATLAS_GLM_HC_SEAM_AR_FOLD: glm_hc_seam_post_fused_bf16 landing the
+// all-reduce of `block_out` itself (the stream's previous op is
+// rdma_oneshot_bf16 in send-only mode); `block_out` keeps this rank's half.
+extern "C" __global__ void __launch_bounds__(128) glm_hc_seam_post_land_fused_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams, float* post,
+    float* comb, const unsigned char* __restrict__ hc_fn, float* __restrict__ partial,
+    unsigned int* __restrict__ counters, const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base, __nv_bfloat16* __restrict__ y_out,
+    const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ norm_out,
+    const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps,
+    const float hc_eps, const float rms_eps, const unsigned char* recv,
+    const unsigned long long slot_stride, const uint64_t* flags, const unsigned int rails,
+    uint64_t* state, uint64_t* poison, const unsigned long long timeout_ns, const unsigned int bytes
+) {
+    atlas_pdl_enter_touch({hc_fn, 8192u, 8192ull}, {hc_fn, 0u, 0ull}, 96u,
+                          blockIdx.y == 0u ? blockIdx.x : (unsigned)GLM_HCD_SPLIT, (unsigned)GLM_HCD_SPLIT);
+    glm_hc_seam_fused_t<true, true>(GLM_HC_SEAM_FUSED_CALL,
+                                    GlmHcsLand{recv, slot_stride, flags, rails, state, poison, timeout_ns, bytes});
 }

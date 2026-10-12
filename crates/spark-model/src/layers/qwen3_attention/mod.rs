@@ -51,7 +51,7 @@ pub use glm_sparse_graphs_policy::{
     glm_c1_decode_graph_vetoed, glm_multi_seq_sparse_graphs_enabled,
 };
 pub(crate) use hc_prefill::{
-    SeamNorm, hc_post_pre_prefill_fused, hc_pre_prefill_mix, hc_seam_norm_fused,
+    SeamNorm, hc_post_pre_prefill_fused, hc_pre_prefill_mix, hc_seam_norm_fused, hc_seam_norm_plan,
 };
 pub(crate) use prefill::{index_split_words, write_floor_legacy};
 pub(crate) use trait_impl::{

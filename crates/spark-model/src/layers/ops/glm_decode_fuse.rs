@@ -279,11 +279,7 @@ pub fn seam_fuse_requested() -> Result<bool> {
 }
 
 fn parse_seam_fuse(value: Option<&str>) -> std::result::Result<bool, String> {
-    match value {
-        None | Some("0") => Ok(false),
-        Some("1") => Ok(true),
-        Some(v) => Err(format!("ATLAS_GLM_HC_SEAM_FUSE must be 0 or 1, got {v:?}")),
-    }
+    parse_switch("ATLAS_GLM_HC_SEAM_FUSE", value)
 }
 
 /// Rows a fused seam serves (up to 8 row groups of 4).
@@ -326,7 +322,22 @@ pub fn seam_fuse_prepare(gpu: &dyn GpuBackend, model_type: &str) -> Result<()> {
     if shipped {
         seam_counters(gpu)?;
     }
+    if shipped && seam_ar_fold_requested()? && gpu.op_cache().once("glm_hc_seam_fuse:fold_log") {
+        if shipped_land(gpu) {
+            tracing::info!("ATLAS_GLM_HC_SEAM_AR_FOLD: post seams land their all-reduce");
+        } else {
+            tracing::warn!(
+                "ATLAS_GLM_HC_SEAM_AR_FOLD=1 ignored: target lacks glm_hc_seam_post_land_fused_bf16"
+            );
+        }
+    }
     Ok(())
+}
+
+const LAND_KERNEL: &str = "glm_hc_seam_post_land_fused_bf16";
+
+fn shipped_land(gpu: &dyn GpuBackend) -> bool {
+    shipped(gpu, LAND_KERNEL).is_some()
 }
 
 /// `glm_hc_seam_{post_,}fused_bf16` when shipped.
@@ -357,6 +368,7 @@ fn vanilla_norm(gpu: &dyn GpuBackend, kernel: KernelHandle) -> bool {
 /// One fused seam's operands. `block_out`: the finishing site's output for
 /// its post, or null (the next site's pre alone). `norm`: the caller's RMS
 /// norm kernel, weight, output and epsilon.
+#[derive(Clone, Copy)]
 pub struct SeamFuse {
     pub block_out: DevicePtr,
     pub streams: DevicePtr,
@@ -377,61 +389,170 @@ pub struct SeamFuse {
     pub rms_eps: f32,
 }
 
-/// Launch the fused seam when the switch is on, the highway is BF16, the
+/// `ATLAS_GLM_HC_SEAM_AR_FOLD` as set: `0` (or unset) or `1`. Read once.
+/// With the fused seam on, a post seam whose block output was all-reduced
+/// over the one-shot pair lands that all-reduce itself
+/// (`glm_hc_seam_post_land_fused_bf16`): the all-reduce kernel only sends.
+pub fn seam_ar_fold_requested() -> Result<bool> {
+    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    ON.get_or_init(|| {
+        parse_switch(
+            "ATLAS_GLM_HC_SEAM_AR_FOLD",
+            std::env::var("ATLAS_GLM_HC_SEAM_AR_FOLD").ok().as_deref(),
+        )
+    })
+    .clone()
+    .map_err(|error| anyhow!(error))
+}
+
+fn parse_switch(name: &str, value: Option<&str>) -> std::result::Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(format!("{name} must be 0 or 1, got {v:?}")),
+    }
+}
+
+/// A fused seam that will launch ([`plan`]): its operands, its kernel and,
+/// when the all-reduce fold may take it, the landing kernel.
+pub struct SeamPlan {
+    args: SeamFuse,
+    kernel: KernelHandle,
+    land_kernel: Option<KernelHandle>,
+}
+
+/// The fused seam for `s` when the switch is on, the highway is BF16, the
 /// site has its BF16 mix weight, the norm is vanilla and the batch is
-/// 1..=32 rows. Returns whether it launched; otherwise the caller runs the
-/// seam and its norm as before.
-pub fn hc_seam_fused(
+/// 1..=32 rows; `None` otherwise (the caller runs the seam and its norm as
+/// before). `fold`: the caller would all-reduce `block_out` with
+/// [`spark_comm::CommBackend::all_reduce_send_async`] if the plan
+/// [`SeamPlan::lands`].
+pub fn plan(
     gpu: &dyn GpuBackend,
     model_type: &str,
     s: &SeamFuse,
-    stream: u64,
-) -> Result<bool> {
+    fold: bool,
+) -> Result<Option<SeamPlan>> {
     if !seam_fuse_requested()? {
-        return Ok(false);
+        return Ok(None);
     }
-    hc_seam_fused_for(gpu, super::hc_bf16_for(model_type), s, stream)
+    let fold = fold && seam_ar_fold_requested()?;
+    Ok(plan_for(gpu, super::hc_bf16_for(model_type), s, fold))
 }
 
-fn hc_seam_fused_for(
+fn plan_for(
     gpu: &dyn GpuBackend,
     bf16_highway: bool,
     s: &SeamFuse,
-    stream: u64,
-) -> Result<bool> {
+    fold: bool,
+) -> Option<SeamPlan> {
     let post = !s.block_out.is_null();
-    let Some(kernel) = seam_fused_kernel(gpu, post) else {
-        return Ok(false);
-    };
+    let kernel = seam_fused_kernel(gpu, post)?;
     if !bf16_highway
         || !(1..=SEAM_FUSE_MAX_ROWS).contains(&s.tokens)
         || s.hc_fn_bf16.is_null()
         || !aligned16(&[s.streams, s.hidden, s.normed, s.norm_weight])
         || !vanilla_norm(gpu, s.norm_kernel)
     {
-        return Ok(false);
+        return None;
     }
-    KernelLaunch::new(gpu, kernel)
-        .grid([64, s.tokens.div_ceil(4), 1])
-        .block([128, 1, 1])
-        .arg_ptr(s.block_out)
-        .arg_ptr(s.streams)
-        .arg_ptr(s.post)
-        .arg_ptr(s.comb)
-        .arg_ptr(s.hc_fn_bf16)
-        .arg_ptr(s.partial)
-        .arg_ptr(seam_counters(gpu)?)
-        .arg_ptr(s.hc_scale)
-        .arg_ptr(s.hc_base)
-        .arg_ptr(s.hidden)
-        .arg_ptr(s.norm_weight)
-        .arg_ptr(s.normed)
-        .arg_u32(s.tokens)
-        .arg_u32(s.sinkhorn_iters)
-        .arg_f32(s.norm_eps)
-        .arg_f32(s.hc_eps)
-        .arg_f32(s.rms_eps)
-        .launch(stream)?;
+    Some(SeamPlan {
+        args: *s,
+        kernel,
+        land_kernel: (fold && post).then(|| shipped(gpu, LAND_KERNEL)).flatten(),
+    })
+}
+
+impl SeamPlan {
+    /// Whether the seam can land its block output's all-reduce.
+    pub fn lands(&self) -> bool {
+        self.land_kernel.is_some()
+    }
+
+    /// Launch on `stream`; `land`: the receive side of the send-only
+    /// all-reduce of `block_out` the stream ran just before (only when
+    /// [`Self::lands`]).
+    pub fn launch(
+        &self,
+        gpu: &dyn GpuBackend,
+        land: Option<spark_comm::ArLanding>,
+        stream: u64,
+    ) -> Result<()> {
+        let s = &self.args;
+        let kernel = match (land, self.land_kernel) {
+            (None, _) => self.kernel,
+            (Some(_), Some(kernel)) => kernel,
+            (Some(_), None) => bail!("fused seam: a landing for a seam that cannot land"),
+        };
+        let launch = KernelLaunch::new(gpu, kernel)
+            .grid([64, s.tokens.div_ceil(4), 1])
+            .block([128, 1, 1])
+            .arg_ptr(s.block_out)
+            .arg_ptr(s.streams)
+            .arg_ptr(s.post)
+            .arg_ptr(s.comb)
+            .arg_ptr(s.hc_fn_bf16)
+            .arg_ptr(s.partial)
+            .arg_ptr(seam_counters(gpu)?)
+            .arg_ptr(s.hc_scale)
+            .arg_ptr(s.hc_base)
+            .arg_ptr(s.hidden)
+            .arg_ptr(s.norm_weight)
+            .arg_ptr(s.normed)
+            .arg_u32(s.tokens)
+            .arg_u32(s.sinkhorn_iters)
+            .arg_f32(s.norm_eps)
+            .arg_f32(s.hc_eps)
+            .arg_f32(s.rms_eps);
+        match land {
+            None => launch.launch(stream),
+            Some(l) => {
+                ensure!(
+                    l.bytes as usize == s.tokens as usize * 4096 * 2,
+                    "fused seam: landing {} bytes for {} rows",
+                    l.bytes,
+                    s.tokens
+                );
+                launch
+                    .arg_ptr(DevicePtr(l.recv))
+                    .arg_u64(l.slot_stride)
+                    .arg_ptr(DevicePtr(l.flags))
+                    .arg_u32(l.rails)
+                    .arg_ptr(DevicePtr(l.state))
+                    .arg_ptr(DevicePtr(l.poison))
+                    .arg_u64(l.timeout_ns)
+                    .arg_u32(l.bytes)
+                    .launch(stream)
+            }
+        }
+    }
+}
+
+/// [`plan`] and launch (no all-reduce fold). Whether it launched.
+pub fn hc_seam_fused(
+    gpu: &dyn GpuBackend,
+    model_type: &str,
+    s: &SeamFuse,
+    stream: u64,
+) -> Result<bool> {
+    let Some(plan) = plan(gpu, model_type, s, false)? else {
+        return Ok(false);
+    };
+    plan.launch(gpu, None, stream)?;
+    Ok(true)
+}
+
+#[cfg(test)]
+fn hc_seam_fused_for(
+    gpu: &dyn GpuBackend,
+    bf16_highway: bool,
+    s: &SeamFuse,
+    stream: u64,
+) -> Result<bool> {
+    let Some(plan) = plan_for(gpu, bf16_highway, s, false) else {
+        return Ok(false);
+    };
+    plan.launch(gpu, None, stream)?;
     Ok(true)
 }
 

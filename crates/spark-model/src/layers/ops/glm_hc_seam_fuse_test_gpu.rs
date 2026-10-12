@@ -422,6 +422,209 @@ fn fused_seam_rows_do_not_depend_on_the_batch() -> Result<()> {
     Ok(())
 }
 
+/// One-shot channel state in device memory for the fold tests: a sequence
+/// `seq0`, the peer payload in receive slot `(seq0 + 1) % 2`, and both
+/// rails' flags already at op `seq0 + 1` (the peer has arrived).
+struct Channel {
+    state: DevicePtr,
+    recv: DevicePtr,
+    flags: DevicePtr,
+    poison: DevicePtr,
+    max: u64,
+    bytes: u32,
+    seq: u64,
+}
+
+const RAILS: u32 = 2;
+
+impl Channel {
+    fn new(gpu: &dyn GpuBackend, seq0: u64, peer: &[u16]) -> Result<Self> {
+        let bytes = (peer.len() * 2) as u32;
+        let max = 32 * H as u64 * 2;
+        let seq = seq0 + 1;
+        let mut state = vec![0u64; 4];
+        state[0] = seq0;
+        let mut recv = vec![0u8; 2 * max as usize];
+        let slot = (seq & 1) as usize * max as usize;
+        recv[slot..slot + bytes as usize].copy_from_slice(&bytes_of(peer));
+        let mut flags = vec![0u64; 8 * RAILS as usize];
+        for r in 0..RAILS as usize {
+            flags[8 * r] = (seq << 24) | u64::from(bytes);
+        }
+        Ok(Self {
+            state: upload(gpu, &bytes_of(&state))?,
+            recv: upload(gpu, &recv)?,
+            flags: upload(gpu, &bytes_of(&flags))?,
+            poison: upload(gpu, &[0u8; 8])?,
+            max,
+            bytes,
+            seq,
+        })
+    }
+
+    fn landing(&self) -> spark_comm::ArLanding {
+        spark_comm::ArLanding {
+            recv: self.recv.0,
+            slot_stride: self.max,
+            flags: self.flags.0,
+            rails: RAILS,
+            state: self.state.0,
+            poison: self.poison.0,
+            timeout_ns: 5_000_000_000,
+            bytes: self.bytes,
+        }
+    }
+
+    /// `rdma_oneshot_bf16` on this channel: `mode` 1 lands `dst += peer`;
+    /// `ONESHOT_SEND_ONLY` (2) stages `src` into `sbuf` and publishes `stage`.
+    #[allow(clippy::too_many_arguments)]
+    fn rdma(
+        &self,
+        gpu: &dyn GpuBackend,
+        dst: DevicePtr,
+        mode: u32,
+        stage: DevicePtr,
+        src: DevicePtr,
+        sbuf: DevicePtr,
+        sm_stage: u32,
+    ) -> Result<()> {
+        let blocks = (self.bytes as usize / 16).div_ceil(256).clamp(1, 16) as u32;
+        KernelLaunch::new(gpu, gpu.kernel("rdma_oneshot", "rdma_oneshot_bf16")?)
+            .grid([blocks, 1, 1])
+            .block([256, 1, 1])
+            .arg_ptr(dst)
+            .arg_ptr(self.recv)
+            .arg_u64(self.max)
+            .arg_u32(self.bytes)
+            .arg_u32(mode)
+            .arg_ptr(self.flags)
+            .arg_u32(RAILS)
+            .arg_ptr(self.state)
+            .arg_ptr(stage)
+            .arg_ptr(self.poison)
+            .arg_u64(5_000_000_000)
+            .arg_ptr(src)
+            .arg_ptr(sbuf)
+            .arg_u32(sm_stage)
+            .launch(gpu.default_stream())
+    }
+
+    /// (sequence, finished-CTA counter, poison) after the op.
+    fn after(&self, gpu: &dyn GpuBackend) -> Result<(u64, u32, u64)> {
+        gpu.synchronize(gpu.default_stream())?;
+        let st = read(gpu, self.state, 32)?;
+        let poison = read(gpu, self.poison, 8)?;
+        Ok((
+            u64::from_le_bytes(st[..8].try_into()?),
+            u32::from_le_bytes(st[8..12].try_into()?),
+            u64::from_le_bytes(poison[..].try_into()?),
+        ))
+    }
+}
+
+/// `ATLAS_GLM_HC_SEAM_AR_FOLD`: the post seam landing a send-only one-shot
+/// all-reduce of its block output writes the bytes `rdma_oneshot_bf16`'s
+/// in-place landing followed by the three launches write, and advances the
+/// channel exactly as that landing does; the send-only all-reduce kernel
+/// stages the payload and publishes it without landing anything.
+#[test]
+#[ignore = "needs a GB10 and a glm-5.3-flash kernel build"]
+fn fused_seam_lands_the_send_only_all_reduce() -> Result<()> {
+    let gpu = backend()?;
+    let mut rng = Rng(0xf01d_ab1e_0000_0001);
+    let site = Site::new(&gpu, &mut rng)?;
+    for rows in 1..=32usize {
+        let x = Rows::random(&mut rng, rows);
+        let peer: Vec<u16> = (0..rows * H).map(|_| bf16(rng.unit() * 1.5)).collect();
+        let seq0 = 1000 + rows as u64;
+
+        // The send-only all-reduce: stages, publishes, lands nothing.
+        let send = Channel::new(&gpu, seq0, &peer)?;
+        let local = upload(&gpu, &bytes_of(&x.block_out))?;
+        let (stage, sbuf) = (
+            upload(&gpu, &[0u8; 4])?,
+            upload(&gpu, &vec![0u8; rows * H * 2])?,
+        );
+        send.rdma(&gpu, local, 2, stage, local, sbuf, 1)?;
+        ensure!(
+            send.after(&gpu)? == (seq0, 0, 0),
+            "send-only: the channel moved"
+        );
+        ensure!(
+            read(&gpu, sbuf, rows * H * 2)? == bytes_of(&x.block_out)
+                && read(&gpu, local, rows * H * 2)? == bytes_of(&x.block_out)
+                && read(&gpu, stage, 4)? == (rows as u32 * 8192).to_le_bytes(),
+            "send-only: staged {rows} rows wrong, or landed"
+        );
+
+        // Reference: rdma_oneshot_bf16 lands in place, then the three launches.
+        let chain_ch = Channel::new(&gpu, seq0, &peer)?;
+        let chain = Bufs::new(&gpu, &x, 0x5a)?;
+        chain_ch.rdma(
+            &gpu,
+            chain.block_out,
+            1,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            DevicePtr::NULL,
+            0,
+        )?;
+        chain.chain(&gpu, &site, true, true)?;
+        let want = chain.out(&gpu)?;
+        ensure!(
+            chain_ch.after(&gpu)? == (send.seq, 0, 0),
+            "reference landing"
+        );
+
+        // The fused seam lands it.
+        let fused_ch = Channel::new(&gpu, seq0, &peer)?;
+        let fused = Bufs::new(&gpu, &x, 0xa5)?;
+        let plan = plan_for(
+            &gpu,
+            true,
+            &SeamFuse {
+                block_out: fused.block_out,
+                streams: fused.streams,
+                post: fused.post,
+                comb: fused.comb,
+                hc_fn_bf16: site.fn16,
+                hc_scale: site.scale,
+                hc_base: site.base,
+                partial: fused.partial,
+                hidden: fused.hidden,
+                norm_kernel: gpu.kernel("glm_rms_norm_regs", "rms_norm_vanilla_regs")?,
+                norm_weight: site.norm_w,
+                normed: fused.normed,
+                tokens: rows as u32,
+                sinkhorn_iters: ITERS,
+                norm_eps: NORM_EPS,
+                hc_eps: HC_EPS,
+                rms_eps: NORM_EPS,
+            },
+            true,
+        )
+        .filter(SeamPlan::lands)
+        .ok_or_else(|| anyhow!("no landing plan"))?;
+        plan.launch(&gpu, Some(fused_ch.landing()), gpu.default_stream())?;
+        let got = fused.out(&gpu)?;
+        ensure!(
+            fused_ch.after(&gpu)? == (send.seq, 0, 0),
+            "fold: the channel at {rows} rows"
+        );
+        if let Some((buf, at)) = got.first_diff(&want) {
+            bail!("fold, rows {rows}: {buf} differs at byte {at}");
+        }
+        ensure!(
+            counters_settled(&gpu)?,
+            "counters off a whole launch at {rows} rows"
+        );
+        eprintln!(
+            "rows {rows}: send-only stage ok; fused landing == rdma landing + three launches"
+        );
+    }
+    Ok(())
+}
+
 /// Indicative only (03 serves other traffic): a CUDA graph of 50
 /// back-to-back seams (PDL edges kept), the three launches against the
 /// fused one, replayed; GPU time a seam, best of 15 alternating trials.

@@ -428,6 +428,26 @@ impl Glm5KdaLayer {
             && ctx
                 .comm
                 .is_some_and(|comm| comm.world_size() == 2 && comm.supports_peer_exchange_async());
+        // ATLAS_GLM_HC_SEAM_FUSE: this site's post, the FFN site's pre and the
+        // post-attention norm in one launch (row t of `normed` is rewritten
+        // only after every CTA of row t has read it). With
+        // ATLAS_GLM_HC_SEAM_AR_FOLD it also lands the all-reduce of `normed`
+        // (not under the det trace, which reads the reduced rows first).
+        let ffn_plan = if fused_tp_hc || sp.is_some() {
+            None
+        } else {
+            self.seam_norm_plan(
+                &self.hc.ffn,
+                Some(normed),
+                hidden,
+                &self.post_attn_norm,
+                normed,
+                m_hc,
+                !crate::det_trace::on(),
+                ctx,
+            )?
+        };
+        let mut landing = None;
         if fused_tp_hc {
             // `moe_output` is a registered, caller-owned [M,H] BF16 arena.
             // The preceding KDA work is done with it, and FFN overwrites it
@@ -443,7 +463,13 @@ impl Glm5KdaLayer {
         } else if ctx.config.tp_world_size > 1
             && let Some(comm) = ctx.comm
         {
-            comm.all_reduce_async(normed.0, tokens * self.hidden_size * 2, stream)?;
+            let bytes = tokens * self.hidden_size * 2;
+            if ffn_plan.as_ref().is_some_and(|plan| plan.lands()) {
+                landing = comm.all_reduce_send_async(normed.0, bytes, stream)?;
+            }
+            if landing.is_none() {
+                comm.all_reduce_async(normed.0, bytes, stream)?;
+            }
         }
         profile::step(ctx, stream, &mut profile_timer, "tp_reduce")?;
         if !fused_tp_hc {
@@ -467,20 +493,10 @@ impl Glm5KdaLayer {
                 stream,
             )?;
         } else {
-            // ATLAS_GLM_HC_SEAM_FUSE: this site's post, the FFN site's pre and
-            // the post-attention norm in one launch (row t of `normed` is
-            // rewritten only after every CTA of row t has read it).
-            ffn_norm_fused = sp.is_none()
-                && self.seam_norm_fused(
-                    &self.hc.ffn,
-                    Some(normed),
-                    hidden,
-                    &self.post_attn_norm,
-                    normed,
-                    m_hc,
-                    ctx,
-                    stream,
-                )?;
+            if let Some(plan) = &ffn_plan {
+                plan.launch(ctx.gpu, landing, stream)?;
+                ffn_norm_fused = true;
+            }
             seam = ffn_norm_fused
                 || crate::layers::qwen3_attention::hc_post_pre_prefill_fused(
                     &self.hc.ffn,

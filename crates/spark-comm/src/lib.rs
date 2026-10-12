@@ -30,6 +30,24 @@ pub mod nccl_backend;
 #[cfg(feature = "nccl")]
 pub use nccl_backend::NcclBackend;
 
+/// The receive side of a send-only one-shot op
+/// ([`CommBackend::all_reduce_send_async`]): the kernel arguments its
+/// consumer lands with (`GlmHcsLand` / `oneshot_land_wait`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ArLanding {
+    /// Receive slot 0 (device address); slot 1 is `slot_stride` bytes on.
+    pub recv: u64,
+    pub slot_stride: u64,
+    /// The per-rail flag words.
+    pub flags: u64,
+    pub rails: u32,
+    /// The channel's device state (sequence, finished CTAs, go).
+    pub state: u64,
+    pub poison: u64,
+    pub timeout_ns: u64,
+    pub bytes: u32,
+}
+
 /// Communication backend trait for distributed operations.
 ///
 /// All collective operations take raw device pointer + byte count.
@@ -131,6 +149,25 @@ pub trait CommBackend: Send + Sync {
         _compute_stream: u64,
     ) -> Result<bool> {
         Ok(false)
+    }
+
+    /// The send half of a BF16 sum all-reduce of `ptr[..bytes]` on `stream`
+    /// (`ATLAS_GLM_HC_SEAM_AR_FOLD`): this rank's payload goes to the peer,
+    /// and the reduction is left to the next kernel on `stream`, which must
+    /// wait for the peer's payload, read it from the returned receive side
+    /// (adding it to `ptr`'s with BF16 `__hadd`, the one-shot landing) and
+    /// advance the sequence (kernels/gb10/common/rdma_oneshot_proto.cuh).
+    /// `ptr` itself keeps this rank's half. On the wire it is the same op as
+    /// [`Self::all_reduce_async`]'s one-shot path, so the peer may take
+    /// either. `None` (nothing enqueued) when that path is unavailable for
+    /// this size; the answer depends only on `bytes` and configuration.
+    fn all_reduce_send_async(
+        &self,
+        _ptr: u64,
+        _bytes: usize,
+        _stream: u64,
+    ) -> Result<Option<ArLanding>> {
+        Ok(None)
     }
 
     /// Graph-capturable BF16 sum all-reduce in place on `stream`: only device

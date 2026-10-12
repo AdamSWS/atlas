@@ -134,6 +134,38 @@ impl Glm5KdaLayer {
         )
     }
 
+    /// [`crate::layers::qwen3_attention::hc_seam_norm_plan`] for this
+    /// layer's site and RMS norm `weight` (into `normed`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn seam_norm_plan(
+        &self,
+        site: &HcSiteWeights,
+        block_out: Option<DevicePtr>,
+        hidden: DevicePtr,
+        weight: &crate::weight_map::DenseWeight,
+        normed: DevicePtr,
+        tokens: u32,
+        fold: bool,
+        ctx: &ForwardContext,
+    ) -> Result<Option<crate::layers::ops::glm_decode_fuse::SeamPlan>> {
+        crate::layers::qwen3_attention::hc_seam_norm_plan(
+            site,
+            block_out,
+            hidden,
+            &crate::layers::qwen3_attention::SeamNorm {
+                kernel: self.rms_norm_k,
+                weight,
+                out: normed,
+            },
+            tokens,
+            self.hc.hc_mult as u32,
+            self.hc.sinkhorn_iters as u32,
+            self.hc.hc_eps,
+            fold,
+            ctx,
+        )
+    }
+
     pub(super) fn hc_post(
         &self,
         block_out: DevicePtr,

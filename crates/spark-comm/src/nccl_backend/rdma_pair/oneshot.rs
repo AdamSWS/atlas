@@ -118,6 +118,8 @@ const THREADS: usize = 256;
 /// Kernel state in device memory (see `rdma_oneshot.cu`): seq, finished
 /// blocks, go, staged blocks.
 const STATE_BYTES: usize = 32;
+/// The kernel's `add` word for a send-only op (`ONESHOT_SEND_ONLY`).
+const SEND_ONLY: u32 = 2;
 const MAX_BLOCKS: usize = 16;
 
 /// Control page after `S` and the two receive slots, one 64-byte line per
@@ -335,9 +337,38 @@ impl OneShot {
         add: bool,
         stream: u64,
     ) -> Result<bool> {
+        Ok(self
+            .enqueue_mode(src, dst, bytes, add as u32, stream)?
+            .is_some())
+    }
+
+    /// Send `src[..bytes]` to the peer and leave the landing to the next
+    /// kernel on `stream` ([`crate::CommBackend::all_reduce_send_async`]):
+    /// the kernel stages and publishes only (`ONESHOT_SEND_ONLY`), and the
+    /// returned receive side is what that consumer waits on, reads and
+    /// advances. `None` (nothing enqueued) as for [`Self::enqueue`].
+    pub(in crate::nccl_backend) fn enqueue_send(
+        &self,
+        src: u64,
+        bytes: usize,
+        stream: u64,
+    ) -> Result<Option<crate::ArLanding>> {
+        self.enqueue_mode(src, src, bytes, SEND_ONLY, stream)
+    }
+
+    /// [`Self::enqueue`] with the kernel's `add` word (0 copy, 1 add,
+    /// [`SEND_ONLY`]); the receive side of the op when enqueued.
+    fn enqueue_mode(
+        &self,
+        src: u64,
+        dst: u64,
+        bytes: usize,
+        mode: u32,
+        stream: u64,
+    ) -> Result<Option<crate::ArLanding>> {
         let kernel = self.kernel.load(Ordering::Relaxed);
         if kernel == 0 || !self.cfg.eligible(bytes) {
-            return Ok(false);
+            return Ok(None);
         }
         let ctrl = self.dev + ctrl_off(self.cfg.max) as u64;
         let stage = ctrl + STAGE as u64;
@@ -361,18 +392,28 @@ impl OneShot {
             )?;
         }
         let blocks = (bytes / 16).div_ceil(THREADS).clamp(1, MAX_BLOCKS) as u32;
+        let landing = crate::ArLanding {
+            recv: self.dev + recv_off(self.cfg.max, 0) as u64,
+            slot_stride: self.cfg.max as u64,
+            flags: ctrl + FLAGS as u64,
+            rails: stripes(bytes, self.rails, self.cfg.stripe_min).len() as u32,
+            state: self.state,
+            poison: ctrl + POISON as u64,
+            timeout_ns: self.cfg.timeout_ns,
+            bytes: bytes as u32,
+        };
         let mut args = (
             dst,
-            self.dev + recv_off(self.cfg.max, 0) as u64,
-            self.cfg.max as u64,
-            bytes as u32,
-            add as u32,
-            ctrl + FLAGS as u64,
-            stripes(bytes, self.rails, self.cfg.stripe_min).len() as u32,
-            self.state,
+            landing.recv,
+            landing.slot_stride,
+            landing.bytes,
+            mode,
+            landing.flags,
+            landing.rails,
+            landing.state,
             if fence { 0 } else { stage },
-            ctrl + POISON as u64,
-            self.cfg.timeout_ns,
+            landing.poison,
+            landing.timeout_ns,
             src,
             self.dev,
             sm,
@@ -436,7 +477,7 @@ impl OneShot {
             poison_host(self.host + ctrl_off(self.cfg.max), POISON_LAUNCH);
         }
         cu(status, "cuLaunchKernel(rdma_oneshot_bf16)")?;
-        Ok(true)
+        Ok(Some(landing))
     }
 }
 

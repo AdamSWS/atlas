@@ -378,6 +378,7 @@ const SEAM: &[(&str, &str)] = &[
     ("rms_norm_vanilla", "rms_norm_vanilla"),
     ("glm_rms_norm_regs", "rms_norm_vanilla_regs"),
     ("norm", "rms_norm"),
+    ("glm_hc_prefill_vec", "glm_hc_seam_post_land_fused_bf16"),
 ];
 
 fn seam(gpu: &Capture, block_out: u64, tokens: u32, norm: (&str, &str)) -> SeamFuse {
@@ -447,6 +448,87 @@ fn fused_seam_leaves_every_other_seam_to_the_three_launches() {
     assert!(off(true, unaligned));
     assert!(gpu.launches().is_empty());
     // A target without the fused kernels keeps its seam.
-    let old = Capture::new(&SEAM[2..]);
+    let old = Capture::new(&SEAM[2..5]);
     assert!(!hc_seam_fused_for(&old, true, &seam(&old, 0, 3, regs), 7).unwrap());
+}
+
+#[test]
+fn ar_fold_flag_is_explicit() {
+    let parse = |v| parse_switch("ATLAS_GLM_HC_SEAM_AR_FOLD", v);
+    assert_eq!(parse(None), Ok(false));
+    assert_eq!(parse(Some("0")), Ok(false));
+    assert_eq!(parse(Some("1")), Ok(true));
+    assert!(parse(Some("yes")).is_err());
+}
+
+#[test]
+fn only_a_post_seam_with_the_fold_lands_and_it_takes_the_receive_side() {
+    let gpu = Capture::new(SEAM);
+    let regs = ("glm_rms_norm_regs", "rms_norm_vanilla_regs");
+    let lands = |block_out, fold| {
+        plan_for(&gpu, true, &seam(&gpu, block_out, 3, regs), fold).map(|p| p.lands())
+    };
+    assert_eq!(lands(0xb000, true), Some(true));
+    assert_eq!(lands(0xb000, false), Some(false));
+    assert_eq!(lands(0, true), Some(false));
+    // A target without the landing kernel plans the plain post seam.
+    let old = Capture::new(&SEAM[..5]);
+    let plan = plan_for(&old, true, &seam(&old, 0xb000, 3, regs), true).unwrap();
+    assert!(!plan.lands());
+    let land = spark_comm::ArLanding {
+        recv: 0x10_0000,
+        slot_stride: 0x4_0000,
+        flags: 0x20_0000,
+        rails: 2,
+        state: 0x30_0000,
+        poison: 0x40_0000,
+        timeout_ns: 7,
+        bytes: 3 * 8192,
+    };
+    assert!(plan.launch(&old, Some(land), 7).is_err());
+    assert!(old.launches().is_empty());
+
+    let plan = plan_for(&gpu, true, &seam(&gpu, 0xb000, 3, regs), true).unwrap();
+    assert!(
+        plan.launch(
+            &gpu,
+            Some(spark_comm::ArLanding {
+                bytes: 8192,
+                ..land
+            }),
+            7
+        )
+        .is_err(),
+        "a landing of another size"
+    );
+    plan.launch(&gpu, Some(land), 7).unwrap();
+    plan.launch(&gpu, None, 7).unwrap();
+    let launches = gpu.launches();
+    assert_eq!(launches.len(), 2);
+    let (kernel, grid, _, args) = &launches[0];
+    assert_eq!(
+        (*kernel, *grid),
+        (
+            gpu.handle("glm_hc_prefill_vec", "glm_hc_seam_post_land_fused_bf16"),
+            [64, 1, 1]
+        )
+    );
+    let tail: Vec<Vec<u8>> = vec![
+        ptr(0x10_0000),
+        0x4_0000u64.to_ne_bytes().to_vec(),
+        ptr(0x20_0000),
+        word(2),
+        ptr(0x30_0000),
+        ptr(0x40_0000),
+        7u64.to_ne_bytes().to_vec(),
+        word(3 * 8192),
+    ];
+    assert_eq!(args.len(), 17 + tail.len());
+    assert_eq!(args[17..], tail[..]);
+    // Without a landing the same plan launches the plain post seam.
+    assert_eq!(
+        launches[1].0,
+        gpu.handle("glm_hc_prefill_vec", "glm_hc_seam_post_fused_bf16")
+    );
+    assert_eq!(launches[1].3[..], args[..17]);
 }
