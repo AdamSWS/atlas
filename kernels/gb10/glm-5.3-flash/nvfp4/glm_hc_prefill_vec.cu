@@ -1109,3 +1109,250 @@ extern "C" __global__ void __launch_bounds__(256) glm_hc_decode_finalize_ilp_bf1
         glm_hc_vec_collapse4(x, s_pre, y_out, t, min(g, 1023u) * 4, g < 1024);
     }
 }
+
+// ── Fused decode seam (ATLAS_GLM_HC_SEAM_FUSE, BF16 highway) ──────────────
+// The whole verify-width seam as one launch: the ILP partial above (with the
+// finishing site's post or without), glm_hc_decode_finalize_ilp_bf16, and the
+// rms_norm_vanilla(_regs) the caller runs on the collapsed row next. Under
+// PDL the three launches cost two extra hand-offs a seam (the finalizer
+// waits for 64 CTAs, the norm for the finalizer) plus the collapsed row's
+// write and re-read; here the 64 CTAs of a row group count themselves in on a
+// device counter, and CTA j of the group, once all 64 have, finalizes and
+// norms the group's row j.
+//
+// Same bytes as the three launches (glm_hc_seam_fuse_test_gpu.rs, every
+// width 1..=32): the partial is the ILP kernel's body unchanged, the
+// finalizer adds the 64 partials in the same order and runs the same gate,
+// Sinkhorn and per-element collapse expressions, and the norm is
+// rms_norm_vanilla_regs' arithmetic at its block shape (1024 threads, hidden
+// 4096): each of its threads' two pairs, each of its 32 warps' butterflies
+// and warp 0's butterfly of the 32 warp sums, here on warps 1..3 with the
+// same lanes. Everything a finalizer reads that other CTAs wrote (the post-ed
+// highway, the partials) is read with ld.global.cg after the counter's
+// acquire, never through L1 or the non-coherent path.
+//
+// Row t depends only on row t (the ILP sums do not depend on the row group):
+// no width-dependent order (canonical verify). Grid (GLM_HCD_SPLIT,
+// ceil(T / GLM_HCD_TG)), block 128. `counters`: a u32 a row group, a 128-byte
+// line apart (GLM_HCS_COUNTER_STRIDE), zero before the first launch; each
+// launch adds GLM_HCD_SPLIT to its groups'. `post` / `comb` are read by the
+// post and rewritten by row t's finalizer once all 64 CTAs of its group have
+// read them.
+__device__ __forceinline__ float glm_hcs_warp_sum(float val) {
+    // rms_norm_vanilla's warp_reduce_sum.
+    for (int offset = 16; offset > 0; offset >>= 1) val += __shfl_xor_sync(0xFFFFFFFF, val, offset);
+    return val;
+}
+
+__device__ __forceinline__ void glm_hcs_unpack(unsigned int packed, float& v0, float& v1) {
+    v0 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed & 0xFFFF)));
+    v1 = __bfloat162float(__ushort_as_bfloat16((unsigned short)(packed >> 16)));
+}
+
+__device__ __forceinline__ unsigned int glm_hcs_pack(float v0, float v1) {
+    unsigned int lo = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v0));
+    unsigned int hi = (unsigned int)__bfloat16_as_ushort(__float2bfloat16(v1));
+    return lo | (hi << 16);
+}
+
+#define GLM_HCS_COUNTER_STRIDE 32                 // u32s: one 128-byte line a row group
+#define GLM_HCS_NORM_WARPS 3                      // warps 1..3 collapse and norm
+#define GLM_HCS_NORM_THREADS (32 * GLM_HCS_NORM_WARPS)
+#define GLM_HCS_PAIRS 2048                        // 4096 / 2
+#define GLM_HCS_PAIRS_PER ((GLM_HCS_PAIRS + GLM_HCS_NORM_THREADS - 1) / GLM_HCS_NORM_THREADS)
+
+template <bool POST>
+__device__ __forceinline__ void glm_hc_seam_fused_t(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams,
+    float* post, float* comb, const unsigned char* __restrict__ hc_fn, float* __restrict__ partial,
+    unsigned int* __restrict__ counters, const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base, __nv_bfloat16* __restrict__ y_out,
+    const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ norm_out,
+    const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps,
+    const float hc_eps, const float rms_eps
+) {
+    constexpr unsigned int H = 4096;
+    const unsigned int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const unsigned int t0 = blockIdx.y * GLM_HCD_TG, rows = min(tokens, t0 + GLM_HCD_TG) - t0;
+    // Phase 1, every CTA: the ILP partial of the row group, columns
+    // blockIdx.x * 64 .. (the ILP kernel's body: the group shares hc_fn).
+    glm_hc_decode_partial_ilp<POST>(block_out, streams, post, comb, hc_fn, partial, tokens);
+    // Count in. The barrier orders every thread's stores before thread 0's
+    // fence and atomic (a cumulative release, as cooperative groups' grid
+    // sync). The group's counter only grows, by GLM_HCD_SPLIT a launch (2^32
+    // is a multiple), so the launch this CTA counts into ends at `target`.
+    // CTAs 0 .. rows-1 then wait for it and finalize row t0 + blockIdx.x;
+    // the others are done. At most 4 waiting CTAs a group (32 a launch) while
+    // every other CTA runs to its end without waiting, so the waits finish
+    // whatever the residency.
+    __shared__ unsigned int s_go;
+    __syncthreads();
+    if (tid == 0) {
+        __threadfence();
+        unsigned int* counter = counters + blockIdx.y * GLM_HCS_COUNTER_STRIDE;
+        const unsigned int old = atomicAdd(counter, 1u);
+        s_go = blockIdx.x < rows;
+        if (blockIdx.x < rows) {
+            const unsigned int target = (old / gridDim.x + 1u) * gridDim.x;
+            for (;;) {
+                unsigned int c;
+                asm volatile("ld.acquire.gpu.global.u32 %0, [%1];" : "=r"(c) : "l"(counter) : "memory");
+                if ((int)(c - target) >= 0) break;
+                __nanosleep(32);
+            }
+            __threadfence();
+        }
+    }
+    __syncthreads();
+    if (s_go == 0u) return;
+    const unsigned int t = t0 + blockIdx.x;
+
+    // Phase 2, row t: glm_hc_decode_finalize_ilp_bf16, then the norm.
+    __shared__ float s_rsqrt;
+    __shared__ float s_mix[HC_MAX_MIX];
+    __shared__ float s_pre[HC_MAX_MULT];
+    __shared__ __align__(16) unsigned int s_y[GLM_HCS_PAIRS];
+    __shared__ float s_wsum[32];
+    unsigned int wv[GLM_HCS_PAIRS_PER];
+    if (warp == 0) {
+        if (tid <= 24) {
+            float p[GLM_HCD_SPLIT];
+            #pragma unroll
+            for (unsigned int c = 0; c < GLM_HCD_SPLIT; ++c)
+                p[c] = __ldcg(partial + ((size_t)c * tokens + t) * 25 + tid);
+            float acc = 0.f;
+            #pragma unroll
+            for (unsigned int c = 0; c < GLM_HCD_SPLIT; ++c) acc += p[c];
+            if (tid < 24) s_mix[tid] = acc;
+            else s_rsqrt = rsqrtf(acc / (float)(4 * 4096) + norm_eps);
+        }
+    } else {
+        // The norm weight pairs this thread stores, read while warp 0 sums.
+        const unsigned int* w32 = reinterpret_cast<const unsigned int*>(norm_w);
+        #pragma unroll
+        for (unsigned int k = 0; k < GLM_HCS_PAIRS_PER; ++k) {
+            const unsigned int i = (tid - 32) + k * GLM_HCS_NORM_THREADS;
+            if (i < GLM_HCS_PAIRS) wv[k] = __ldg(w32 + i);
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {
+        if (tid < 4) glm_hc_vec_gates(s_rsqrt, s_mix, s_pre, hc_scale, hc_base, post, t, tid, hc_eps);
+        __syncwarp();
+        asm volatile("bar.arrive 1, 128;" ::: "memory");   // s_pre is ready
+        if (tid < 16)
+            glm_hc_vec_sinkhorn(s_rsqrt, s_mix, hc_scale, hc_base, comb, t, tid, sinkhorn_iters, hc_eps);
+        return;
+    }
+    asm volatile("bar.sync 1, 128;" ::: "memory");
+    const unsigned int nt = tid - 32;
+    // Collapse (glm_hc_vec_collapse4's per-element expression), 8 columns a
+    // group, into y_out and s_y: 512 groups over 96 threads, every load of a
+    // thread issued together (a spare group is loaded clamped, never stored).
+    const __nv_bfloat16* x = streams + (size_t)t * 4 * H;
+    constexpr unsigned int GROUPS = H / 8, PASSES = (GROUPS + GLM_HCS_NORM_THREADS - 1) / GLM_HCS_NORM_THREADS;
+    uint4 raw[PASSES][4];
+    #pragma unroll
+    for (unsigned int k = 0; k < PASSES; ++k) {
+        const unsigned int d = min(nt + k * GLM_HCS_NORM_THREADS, GROUPS - 1) * 8;
+        #pragma unroll
+        for (unsigned int i = 0; i < 4; ++i) raw[k][i] = __ldcg(reinterpret_cast<const uint4*>(x + i * H + d));
+    }
+    #pragma unroll
+    for (unsigned int k = 0; k < PASSES; ++k) {
+        const unsigned int g = nt + k * GLM_HCS_NORM_THREADS;
+        unsigned int packed[4];
+        #pragma unroll
+        for (unsigned int q = 0; q < 4; ++q) {
+            float acc0 = 0.f, acc1 = 0.f;
+            #pragma unroll
+            for (unsigned int i = 0; i < 4; ++i) {
+                const unsigned int u = (&raw[k][i].x)[q];
+                acc0 += s_pre[i] * __uint_as_float(u << 16);
+                acc1 += s_pre[i] * __uint_as_float(u & 0xffff0000u);
+            }
+            packed[q] = (unsigned)__bfloat16_as_ushort(__float2bfloat16(acc0))
+                | ((unsigned)__bfloat16_as_ushort(__float2bfloat16(acc1)) << 16);
+        }
+        if (g < GROUPS) {
+            const uint4 y = make_uint4(packed[0], packed[1], packed[2], packed[3]);
+            *reinterpret_cast<uint4*>(y_out + (size_t)t * H + g * 8) = y;
+            *reinterpret_cast<uint4*>(&s_y[g * 4]) = y;
+        }
+    }
+    asm volatile("bar.sync 2, 96;" ::: "memory");
+    // rms_norm_vanilla_regs at block 1024: virtual thread v = 32 * vw + lane
+    // sums pairs v and v + 1024 (its k = 0, 1; k = 2, 3 fall past the row).
+    // This warp's virtual warps vw = warp - 1 + 3j, their butterflies
+    // interleaved (each one the same shuffle sequence as warp_reduce_sum).
+    constexpr unsigned int VW = (32 + GLM_HCS_NORM_WARPS - 1) / GLM_HCS_NORM_WARPS;
+    float sum_sq[VW];
+    #pragma unroll
+    for (unsigned int j = 0; j < VW; ++j) {
+        const unsigned int vw = min(warp - 1 + j * GLM_HCS_NORM_WARPS, 31u);
+        sum_sq[j] = 0.0f;
+        #pragma unroll
+        for (unsigned int k = 0; k < 2; k++) {
+            float v0, v1;
+            glm_hcs_unpack(s_y[vw * 32 + lane + k * 1024], v0, v1);
+            sum_sq[j] += v0 * v0 + v1 * v1;
+        }
+    }
+    #pragma unroll
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        #pragma unroll
+        for (unsigned int j = 0; j < VW; ++j) sum_sq[j] += __shfl_xor_sync(0xFFFFFFFF, sum_sq[j], offset);
+    }
+    #pragma unroll
+    for (unsigned int j = 0; j < VW; ++j) {
+        const unsigned int vw = warp - 1 + j * GLM_HCS_NORM_WARPS;
+        if (lane == 0 && vw < 32) s_wsum[vw] = sum_sq[j];
+    }
+    asm volatile("bar.sync 2, 96;" ::: "memory");
+    const float total = glm_hcs_warp_sum(s_wsum[lane]);
+    const float rms = rsqrtf(total / (float)H + rms_eps);
+    unsigned int* out32 = reinterpret_cast<unsigned int*>(norm_out + (size_t)t * H);
+    #pragma unroll
+    for (unsigned int k = 0; k < GLM_HCS_PAIRS_PER; ++k) {
+        const unsigned int i = nt + k * GLM_HCS_NORM_THREADS;
+        if (i < GLM_HCS_PAIRS) {
+            float xv0, xv1, wv0, wv1;
+            glm_hcs_unpack(s_y[i], xv0, xv1);
+            glm_hcs_unpack(wv[k], wv0, wv1);
+            out32[i] = glm_hcs_pack(xv0 * rms * wv0, xv1 * rms * wv1);
+        }
+    }
+}
+
+// The touch is the ILP partial's (the next site's BF16 hc_fn over the 64 CTAs
+// of row 0). Both kernels take the same arguments.
+#define GLM_HC_SEAM_FUSED_CALL                                                                      \
+    block_out, streams, post, comb, hc_fn, partial, counters, hc_scale, hc_base, y_out, norm_w,     \
+        norm_out, tokens, sinkhorn_iters, norm_eps, hc_eps, rms_eps
+extern "C" __global__ void __launch_bounds__(128) glm_hc_seam_post_fused_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams, float* post,
+    float* comb, const unsigned char* __restrict__ hc_fn, float* __restrict__ partial,
+    unsigned int* __restrict__ counters, const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base, __nv_bfloat16* __restrict__ y_out,
+    const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ norm_out,
+    const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps,
+    const float hc_eps, const float rms_eps
+) {
+    atlas_pdl_enter_touch({hc_fn, 8192u, 8192ull}, {hc_fn, 0u, 0ull}, 96u,
+                          blockIdx.y == 0u ? blockIdx.x : (unsigned)GLM_HCD_SPLIT, (unsigned)GLM_HCD_SPLIT);
+    glm_hc_seam_fused_t<true>(GLM_HC_SEAM_FUSED_CALL);
+}
+
+extern "C" __global__ void __launch_bounds__(128) glm_hc_seam_fused_bf16(
+    const __nv_bfloat16* __restrict__ block_out, __nv_bfloat16* __restrict__ streams, float* post,
+    float* comb, const unsigned char* __restrict__ hc_fn, float* __restrict__ partial,
+    unsigned int* __restrict__ counters, const float* __restrict__ hc_scale,
+    const float* __restrict__ hc_base, __nv_bfloat16* __restrict__ y_out,
+    const __nv_bfloat16* __restrict__ norm_w, __nv_bfloat16* __restrict__ norm_out,
+    const unsigned int tokens, const unsigned int sinkhorn_iters, const float norm_eps,
+    const float hc_eps, const float rms_eps
+) {
+    atlas_pdl_enter_touch({hc_fn, 8192u, 8192ull}, {hc_fn, 0u, 0ull}, 96u,
+                          blockIdx.y == 0u ? blockIdx.x : (unsigned)GLM_HCD_SPLIT, (unsigned)GLM_HCD_SPLIT);
+    glm_hc_seam_fused_t<false>(GLM_HC_SEAM_FUSED_CALL);
+}

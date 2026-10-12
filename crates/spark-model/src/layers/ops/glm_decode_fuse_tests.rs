@@ -361,3 +361,92 @@ fn flag_off_seam_keeps_its_kernels_and_fp32_weight() {
     }
     assert_eq!(hc_decode_finalize(&gpu, "glm5_next").unwrap().0, 3);
 }
+
+#[test]
+fn seam_fuse_flag_is_explicit() {
+    assert_eq!(parse_seam_fuse(None), Ok(false));
+    assert_eq!(parse_seam_fuse(Some("0")), Ok(false));
+    assert_eq!(parse_seam_fuse(Some("1")), Ok(true));
+    for bad in ["2", "true", "on", ""] {
+        assert!(parse_seam_fuse(Some(bad)).is_err(), "{bad:?}");
+    }
+}
+
+const SEAM: &[(&str, &str)] = &[
+    ("glm_hc_prefill_vec", "glm_hc_seam_fused_bf16"),
+    ("glm_hc_prefill_vec", "glm_hc_seam_post_fused_bf16"),
+    ("rms_norm_vanilla", "rms_norm_vanilla"),
+    ("glm_rms_norm_regs", "rms_norm_vanilla_regs"),
+    ("norm", "rms_norm"),
+];
+
+fn seam(gpu: &Capture, block_out: u64, tokens: u32, norm: (&str, &str)) -> SeamFuse {
+    SeamFuse {
+        block_out: DevicePtr(block_out),
+        streams: DevicePtr(0x1000),
+        post: DevicePtr(0x2000),
+        comb: DevicePtr(0x3000),
+        hc_fn_bf16: DevicePtr(0x4002),
+        hc_scale: DevicePtr(0x5000),
+        hc_base: DevicePtr(0x6000),
+        partial: DevicePtr(0x7000),
+        hidden: DevicePtr(0x8000),
+        norm_kernel: KernelHandle(gpu.handle(norm.0, norm.1)),
+        norm_weight: DevicePtr(0x9000),
+        normed: DevicePtr(0xa000),
+        tokens,
+        sinkhorn_iters: 20,
+        norm_eps: 1e-5,
+        hc_eps: 1e-6,
+        rms_eps: 2e-5,
+    }
+}
+
+#[test]
+fn fused_seam_launches_a_row_of_ctas_a_row_group_with_its_counters() {
+    let gpu = Capture::new(SEAM);
+    let regs = ("glm_rms_norm_regs", "rms_norm_vanilla_regs");
+    assert!(hc_seam_fused_for(&gpu, true, &seam(&gpu, 0, 3, regs), 7).unwrap());
+    let vanilla = ("rms_norm_vanilla", "rms_norm_vanilla");
+    assert!(hc_seam_fused_for(&gpu, true, &seam(&gpu, 0xb000, 32, vanilla), 7).unwrap());
+    let counters = seam_counters(&gpu).unwrap();
+    let launches = gpu.launches();
+    assert_eq!(launches.len(), 2);
+    for ((kernel, grid, block, args), (name, block_out, rows)) in launches.iter().zip([
+        ("glm_hc_seam_fused_bf16", 0, 3u32),
+        ("glm_hc_seam_post_fused_bf16", 0xb000, 32),
+    ]) {
+        assert_eq!(*kernel, gpu.handle("glm_hc_prefill_vec", name));
+        assert_eq!((*grid, *block), ([64, rows.div_ceil(4), 1], [128, 1, 1]));
+        let mut want: Vec<Vec<u8>> = [
+            block_out, 0x1000, 0x2000, 0x3000, 0x4002, 0x7000, counters.0, 0x5000, 0x6000, 0x8000,
+            0x9000, 0xa000,
+        ]
+        .map(ptr)
+        .to_vec();
+        want.extend([word(rows), word(20)]);
+        want.extend([1e-5f32, 1e-6, 2e-5].map(|v| v.to_ne_bytes().to_vec()));
+        assert_eq!(args[..], want[..]);
+    }
+}
+
+#[test]
+fn fused_seam_leaves_every_other_seam_to_the_three_launches() {
+    let gpu = Capture::new(SEAM);
+    let regs = ("glm_rms_norm_regs", "rms_norm_vanilla_regs");
+    let off = |bf16, s: SeamFuse| !hc_seam_fused_for(&gpu, bf16, &s, 7).unwrap();
+    assert!(off(false, seam(&gpu, 0, 3, regs)));
+    assert!(off(true, seam(&gpu, 0, 0, regs)));
+    assert!(off(true, seam(&gpu, 0, 33, regs)));
+    assert!(off(true, seam(&gpu, 0, 3, ("norm", "rms_norm"))));
+    let mut no_bf16_fn = seam(&gpu, 0, 3, regs);
+    no_bf16_fn.hc_fn_bf16 = DevicePtr::NULL;
+    assert!(off(true, no_bf16_fn));
+    let mut unaligned = seam(&gpu, 0, 3, regs);
+    unaligned.normed = DevicePtr(0xa008);
+    assert!(off(true, unaligned));
+    assert!(gpu.launches().is_empty());
+    // A target without the fused kernels keeps its seam.
+    let old = Capture::new(&SEAM[2..]);
+    assert!(!hc_seam_fused_for(&old, true, &seam(&old, 0, 3, regs), 7).unwrap());
+}

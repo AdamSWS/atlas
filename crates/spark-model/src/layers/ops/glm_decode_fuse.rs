@@ -39,6 +39,13 @@
 //!   ([`HcSiteWeights::hc_fn_bf16`](crate::layers::qwen3_attention::HcSiteWeights)),
 //!   half the bytes of the FP32 copy. Sites without one keep their kernel.
 //! * `2` finalize: `glm_hc_decode_finalize_ilp_bf16`.
+//!
+//! `ATLAS_GLM_HC_SEAM_FUSE=1` (default off) runs a whole decode seam and the
+//! RMS norm its caller applies next as one `glm_hc_seam_{post_,}fused_bf16`
+//! launch ([`hc_seam_fused`]): the ILP partial, then, once a row group's 64
+//! CTAs have counted in on a device counter ([`seam_counters`]), its first
+//! CTAs finalize and norm a row each. Same bytes as the three launches; it needs the ILP partial's BF16
+//! mix weight and a vanilla RMS norm.
 
 use anyhow::{Result, anyhow, bail, ensure};
 use spark_runtime::gpu::{DevicePtr, GpuBackend, KernelHandle};
@@ -263,6 +270,171 @@ pub fn hc_decode_finalize(gpu: &dyn GpuBackend, model_type: &str) -> Result<Kern
     )
 }
 
+/// `ATLAS_GLM_HC_SEAM_FUSE` as set: `0` (or unset) or `1`. Read once.
+pub fn seam_fuse_requested() -> Result<bool> {
+    static ON: OnceLock<std::result::Result<bool, String>> = OnceLock::new();
+    ON.get_or_init(|| parse_seam_fuse(std::env::var("ATLAS_GLM_HC_SEAM_FUSE").ok().as_deref()))
+        .clone()
+        .map_err(|error| anyhow!(error))
+}
+
+fn parse_seam_fuse(value: Option<&str>) -> std::result::Result<bool, String> {
+    match value {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(v) => Err(format!("ATLAS_GLM_HC_SEAM_FUSE must be 0 or 1, got {v:?}")),
+    }
+}
+
+/// Rows a fused seam serves (up to 8 row groups of 4).
+pub const SEAM_FUSE_MAX_ROWS: u32 = 32;
+const SEAM_COUNTERS: &str = "glm_hc_seam_fuse:counters";
+/// One 128-byte line a row group (`GLM_HCS_COUNTER_STRIDE`): groups never
+/// share the line their CTAs count in on.
+const SEAM_COUNTER_BYTES: usize = SEAM_FUSE_MAX_ROWS.div_ceil(4) as usize * 128;
+
+/// The fused seam's row-group counters: allocated and zeroed on this
+/// backend's first call (a synchronous memset, so the first call must not be
+/// inside a stream capture: the GLM layers make it at build,
+/// [`seam_fuse_prepare`]); every launch adds 64 to each group's. One set per
+/// backend, like the seam's other scratch (the partials in
+/// `gate_logits_f32`, the highway, post and comb): seams never run
+/// concurrently on two streams.
+pub fn seam_counters(gpu: &dyn GpuBackend) -> Result<DevicePtr> {
+    let cache = gpu.op_cache();
+    let counters = cache.scratch(gpu, SEAM_COUNTERS, SEAM_COUNTER_BYTES)?;
+    if cache.once(SEAM_COUNTERS) {
+        gpu.memset(counters, 0, SEAM_COUNTER_BYTES)?;
+    }
+    Ok(counters)
+}
+
+/// Layer build: when the switch is on and the target ships the fused seam,
+/// allocate and zero its counters now (outside any capture) and say so once.
+pub fn seam_fuse_prepare(gpu: &dyn GpuBackend, model_type: &str) -> Result<()> {
+    if !seam_fuse_requested()? || model_type != "glm5_next" {
+        return Ok(());
+    }
+    let shipped = seam_fused_kernel(gpu, true).is_some() && seam_fused_kernel(gpu, false).is_some();
+    if gpu.op_cache().once("glm_hc_seam_fuse:log") {
+        if shipped {
+            tracing::info!("ATLAS_GLM_HC_SEAM_FUSE: decode seam + norm in one launch");
+        } else {
+            tracing::warn!("ATLAS_GLM_HC_SEAM_FUSE=1 ignored: target lacks glm_hc_seam_fused_bf16");
+        }
+    }
+    if shipped {
+        seam_counters(gpu)?;
+    }
+    Ok(())
+}
+
+/// `glm_hc_seam_{post_,}fused_bf16` when shipped.
+fn seam_fused_kernel(gpu: &dyn GpuBackend, post: bool) -> Option<KernelHandle> {
+    shipped(
+        gpu,
+        if post {
+            "glm_hc_seam_post_fused_bf16"
+        } else {
+            "glm_hc_seam_fused_bf16"
+        },
+    )
+}
+
+/// Whether `kernel` is a vanilla RMS norm (`rms_norm_vanilla` or its
+/// register twin, same bytes): the norm the fused seam reproduces.
+fn vanilla_norm(gpu: &dyn GpuBackend, kernel: KernelHandle) -> bool {
+    let cache = gpu.op_cache();
+    kernel.0 != 0
+        && [
+            ("rms_norm_vanilla", "rms_norm_vanilla"),
+            ("glm_rms_norm_regs", "rms_norm_vanilla_regs"),
+        ]
+        .iter()
+        .any(|&(m, n)| cache.kernel(gpu, m, n).is_ok_and(|k| k.0 == kernel.0))
+}
+
+/// One fused seam's operands. `block_out`: the finishing site's output for
+/// its post, or null (the next site's pre alone). `norm`: the caller's RMS
+/// norm kernel, weight, output and epsilon.
+pub struct SeamFuse {
+    pub block_out: DevicePtr,
+    pub streams: DevicePtr,
+    pub post: DevicePtr,
+    pub comb: DevicePtr,
+    pub hc_fn_bf16: DevicePtr,
+    pub hc_scale: DevicePtr,
+    pub hc_base: DevicePtr,
+    pub partial: DevicePtr,
+    pub hidden: DevicePtr,
+    pub norm_kernel: KernelHandle,
+    pub norm_weight: DevicePtr,
+    pub normed: DevicePtr,
+    pub tokens: u32,
+    pub sinkhorn_iters: u32,
+    pub norm_eps: f32,
+    pub hc_eps: f32,
+    pub rms_eps: f32,
+}
+
+/// Launch the fused seam when the switch is on, the highway is BF16, the
+/// site has its BF16 mix weight, the norm is vanilla and the batch is
+/// 1..=32 rows. Returns whether it launched; otherwise the caller runs the
+/// seam and its norm as before.
+pub fn hc_seam_fused(
+    gpu: &dyn GpuBackend,
+    model_type: &str,
+    s: &SeamFuse,
+    stream: u64,
+) -> Result<bool> {
+    if !seam_fuse_requested()? {
+        return Ok(false);
+    }
+    hc_seam_fused_for(gpu, super::hc_bf16_for(model_type), s, stream)
+}
+
+fn hc_seam_fused_for(
+    gpu: &dyn GpuBackend,
+    bf16_highway: bool,
+    s: &SeamFuse,
+    stream: u64,
+) -> Result<bool> {
+    let post = !s.block_out.is_null();
+    let Some(kernel) = seam_fused_kernel(gpu, post) else {
+        return Ok(false);
+    };
+    if !bf16_highway
+        || !(1..=SEAM_FUSE_MAX_ROWS).contains(&s.tokens)
+        || s.hc_fn_bf16.is_null()
+        || !aligned16(&[s.streams, s.hidden, s.normed, s.norm_weight])
+        || !vanilla_norm(gpu, s.norm_kernel)
+    {
+        return Ok(false);
+    }
+    KernelLaunch::new(gpu, kernel)
+        .grid([64, s.tokens.div_ceil(4), 1])
+        .block([128, 1, 1])
+        .arg_ptr(s.block_out)
+        .arg_ptr(s.streams)
+        .arg_ptr(s.post)
+        .arg_ptr(s.comb)
+        .arg_ptr(s.hc_fn_bf16)
+        .arg_ptr(s.partial)
+        .arg_ptr(seam_counters(gpu)?)
+        .arg_ptr(s.hc_scale)
+        .arg_ptr(s.hc_base)
+        .arg_ptr(s.hidden)
+        .arg_ptr(s.norm_weight)
+        .arg_ptr(s.normed)
+        .arg_u32(s.tokens)
+        .arg_u32(s.sinkhorn_iters)
+        .arg_f32(s.norm_eps)
+        .arg_f32(s.hc_eps)
+        .arg_f32(s.rms_eps)
+        .launch(stream)?;
+    Ok(true)
+}
+
 fn seam_partial_twin(
     mask: u32,
     gpu: &dyn GpuBackend,
@@ -378,3 +550,7 @@ fn moe_unpermute_blend_for(
 #[cfg(test)]
 #[path = "glm_decode_fuse_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "glm_hc_seam_fuse_test_gpu.rs"]
+mod seam_fuse_gpu_tests;

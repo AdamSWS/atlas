@@ -86,6 +86,8 @@ pub(super) const PDL_KERNELS: &[&str] = &[
     "glm_hc_decode_partial_ilp_bf16",
     "glm_hc_decode_post_partial_ilp_bf16",
     "glm_hc_decode_finalize_ilp_bf16",
+    "glm_hc_seam_fused_bf16",
+    "glm_hc_seam_post_fused_bf16",
     "hc_post_bf16",
     "moe_topk_sigmoid_batched",
     "moe_sort_by_expert",

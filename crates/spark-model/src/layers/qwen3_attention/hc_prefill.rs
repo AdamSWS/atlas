@@ -145,6 +145,83 @@ fn finalize_ss(
         .launch(stream)
 }
 
+/// `ATLAS_GLM_HC_POST_MIX`, `ATLAS_GLM_HC_DECODE_SEAM`, read once.
+fn seam_flags() -> (bool, bool) {
+    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let flag = |k| std::env::var(k).as_deref() == Ok("1");
+        (
+            flag("ATLAS_GLM_HC_POST_MIX"),
+            flag("ATLAS_GLM_HC_DECODE_SEAM"),
+        )
+    })
+}
+
+/// The GLM HC4/4096 shape, highway and partial scratch every fused seam needs.
+fn seam_shape_fits(hc_mult: u32, tokens: u32, ctx: &ForwardContext) -> bool {
+    hc_mult == 4
+        && ctx.config.hidden_size == 4096
+        && ctx.config.model_type == "glm5_next"
+        && (ops::hc_bf16_for(&ctx.config.model_type) || fused_prefill("glm5_next", 4096, 4, tokens))
+        && ctx.buffers.sizes().gate_logits_f32 >= (tokens as usize * 25 * 4).max(64 * 32 * 25 * 4)
+}
+
+/// The RMS norm a seam's caller applies to `hidden` next: kernel, weight,
+/// output rows and epsilon.
+pub(crate) struct SeamNorm<'a> {
+    pub kernel: KernelHandle,
+    pub weight: &'a crate::weight_map::DenseWeight,
+    pub out: DevicePtr,
+}
+
+/// The decode seam ([`hc_post_pre_prefill_fused`] at <= 32 rows) and the
+/// caller's RMS norm of `hidden` as one launch (`ATLAS_GLM_HC_SEAM_FUSE=1`,
+/// [`ops::glm_decode_fuse::hc_seam_fused`]). Returns false (nothing
+/// launched) when it does not apply; the caller then runs the seam and its
+/// norm as before.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn hc_seam_norm_fused(
+    next: &HcSiteWeights,
+    block_out: Option<DevicePtr>,
+    hidden: DevicePtr,
+    norm: &SeamNorm,
+    tokens: u32,
+    hc_mult: u32,
+    sinkhorn_iters: u32,
+    hc_eps: f32,
+    ctx: &ForwardContext,
+    stream: u64,
+) -> Result<bool> {
+    if !seam_flags().1 || !seam_shape_fits(hc_mult, tokens, ctx) {
+        return Ok(false);
+    }
+    let eps = ctx.config.rms_norm_eps as f32;
+    ops::glm_decode_fuse::hc_seam_fused(
+        ctx.gpu,
+        &ctx.config.model_type,
+        &ops::glm_decode_fuse::SeamFuse {
+            block_out: block_out.unwrap_or(DevicePtr::NULL),
+            streams: ctx.buffers.hc_streams(),
+            post: ctx.buffers.hc_post(),
+            comb: ctx.buffers.hc_comb(),
+            hc_fn_bf16: next.hc_fn_bf16,
+            hc_scale: next.hc_scale,
+            hc_base: next.hc_base,
+            partial: ctx.buffers.gate_logits_f32(),
+            hidden,
+            norm_kernel: norm.kernel,
+            norm_weight: norm.weight.weight,
+            normed: norm.out,
+            tokens,
+            sinkhorn_iters,
+            norm_eps: eps,
+            hc_eps,
+            rms_eps: eps,
+        },
+        stream,
+    )
+}
+
 /// GLM HC4 seam: the finishing site's `hc_post` of `block_out` fused with
 /// the next site's pre-mix, then the finalizer writes `hidden` and the next
 /// post/comb. `block_out = None` runs the next site's pre alone.
@@ -169,24 +246,10 @@ pub(crate) fn hc_post_pre_prefill_fused(
     ctx: &ForwardContext,
     stream: u64,
 ) -> Result<bool> {
-    static ON: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
-    let (prefill_on, decode_on) = *ON.get_or_init(|| {
-        let flag = |k| std::env::var(k).as_deref() == Ok("1");
-        (
-            flag("ATLAS_GLM_HC_POST_MIX"),
-            flag("ATLAS_GLM_HC_DECODE_SEAM"),
-        )
-    });
+    let (prefill_on, decode_on) = seam_flags();
     let prefill = prefill_on && block_out.is_some() && tokens >= 512;
     let decode = decode_on && (1..=32).contains(&tokens);
-    if !(prefill || decode)
-        || hc_mult != 4
-        || ctx.config.hidden_size != 4096
-        || ctx.config.model_type != "glm5_next"
-        || !(ops::hc_bf16_for(&ctx.config.model_type)
-            || fused_prefill("glm5_next", 4096, 4, tokens))
-        || ctx.buffers.sizes().gate_logits_f32 < (tokens as usize * 25 * 4).max(64 * 32 * 25 * 4)
-    {
+    if !(prefill || decode) || !seam_shape_fits(hc_mult, tokens, ctx) {
         return Ok(false);
     }
     let raw_mix = ctx.buffers.gate_logits_f32();

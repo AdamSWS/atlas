@@ -66,6 +66,8 @@ impl Glm5KdaLayer {
             |func| super::super::try_kernel_gated(triple_fits, gpu, "dense_gemv_bf16_batchm", func);
         // ATLAS_GLM_DECODE_GEMV_BATCH: the GEMV touch twins live in this target only.
         super::super::ops::gemv_touch_resolve(gpu);
+        // ATLAS_GLM_HC_SEAM_FUSE: the fused seam's counters, zeroed at build.
+        super::super::ops::glm_decode_fuse::seam_fuse_prepare(gpu, &config.model_type)?;
         let layer = Self {
             input_norm,
             post_attn_norm,

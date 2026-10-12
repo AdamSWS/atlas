@@ -67,6 +67,44 @@ impl Qwen3AttentionLayer {
         Ok(())
     }
 
+    /// [`super::super::hc_seam_norm_fused`] for a GLM site of this layer and
+    /// its block-input RMS norm `weight` (into `normed`), when `eligible`
+    /// (no sequence-parallel rows, no diagnostics). Whether it launched.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn glm_seam_norm_fused(
+        &self,
+        hc: &HcWeights,
+        site: &HcSiteWeights,
+        block_out: Option<DevicePtr>,
+        hidden: DevicePtr,
+        weight: &crate::weight_map::DenseWeight,
+        normed: DevicePtr,
+        n: u32,
+        eligible: bool,
+        ctx: &ForwardContext,
+        stream: u64,
+    ) -> Result<bool> {
+        Ok(eligible
+            && ctx.config.model_type == "glm5_next"
+            && ops::HcVariant::of(hc).applies_block_input_norm()
+            && super::super::hc_seam_norm_fused(
+                site,
+                block_out,
+                hidden,
+                &super::super::SeamNorm {
+                    kernel: self.rms_norm_w_k,
+                    weight,
+                    out: normed,
+                },
+                n,
+                hc.hc_mult as u32,
+                hc.sinkhorn_iters as u32,
+                hc.hc_eps,
+                ctx,
+                stream,
+            )?)
+    }
+
     /// Whether the attention site's post ran fused with the FFN site's
     /// pre-mix (GLM only, never under diagnostics).
     #[allow(clippy::too_many_arguments)]

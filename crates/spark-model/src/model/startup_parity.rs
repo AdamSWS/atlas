@@ -184,6 +184,9 @@ const SETTINGS: &[(&str, fn() -> Result<u64>)] = &[
     ("ATLAS_GLM_MOE_ROUTE_FUSE", || {
         Ok(moe::route_fuse_requested()? as u64)
     }),
+    ("ATLAS_GLM_HC_SEAM_FUSE", || {
+        Ok(ops::glm_decode_fuse::seam_fuse_requested()? as u64)
+    }),
     ("ATLAS_GLM_KDA_COMMIT_CTAS", || {
         Ok(ops::kda_commit_ctas()? as u64)
     }),
