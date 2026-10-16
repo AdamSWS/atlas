@@ -72,9 +72,12 @@ fn setup_model(
         ep_rank: 0,
         ep_world_size: 1,
         num_experts: 0,
+        rank0_only_expert_prefix: None,
+        replicated_expert_prefix: None,
         peak_memory_multiplier: None,
         skip_activation_scales: false,
         skip_mtp: false,
+        skip_layer_prefix: None,
         skip_prefixes: Vec::new(),
         pack_slab: false,
     };

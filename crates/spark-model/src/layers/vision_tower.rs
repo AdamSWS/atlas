@@ -33,6 +33,39 @@ impl VisionTower {
         }
     }
 
+    /// Forward vision items while preserving temporal groups — the
+    /// per-item shim the EP vision splice paths use (`VisionEncoder::
+    /// forward_items` semantics on either tower).
+    pub fn forward_items(
+        &self,
+        items: &[&crate::VisionItem],
+        gpu: &dyn GpuBackend,
+        stream: u64,
+    ) -> Result<Vec<(usize, usize, usize)>> {
+        match self {
+            VisionTower::Qwen(v) => v.forward_items(items, gpu, stream),
+            VisionTower::Radio(r) => {
+                let mut images = Vec::new();
+                for item in items {
+                    for group in &item.groups {
+                        images.push((group.as_slice(), item.grid_h, item.grid_w));
+                    }
+                }
+                r.forward_batched(&images, gpu, stream)
+            }
+        }
+    }
+
+    /// Merged rows `out_row` can hold for one request — the splice/wire
+    /// bound (`VisionEncoder::output_rows` semantics; Radio's merged rows
+    /// are p_max/4 per its buffer geometry).
+    pub fn output_rows(&self) -> usize {
+        match self {
+            VisionTower::Qwen(v) => v.output_rows(),
+            VisionTower::Radio(r) => r.p_max / 4,
+        }
+    }
+
     /// Encode every `(pixels, grid_h, grid_w)` item into the packed
     /// `out_row` buffer; returns per-item `(h', w', merged_p)`.
     pub fn forward_batched(

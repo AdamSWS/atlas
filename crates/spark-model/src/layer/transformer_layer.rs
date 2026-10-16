@@ -7,7 +7,7 @@ use atlas_core::config::ModelConfig;
 use spark_runtime::gpu::{DevicePtr, GpuBackend};
 use spark_runtime::kv_cache::PagedKvCache;
 
-use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState};
+use super::{BatchedAttnMetadata, ForwardContext, GdnPrefillBuffers, LayerState, MultiPass};
 
 mod default_loops;
 
@@ -45,6 +45,39 @@ pub const VERIFY_WY_LAYER_STRIDE_BYTES: usize =
     VERIFY_WY_TABLES_PER_LAYER * VERIFY_WY_TABLE_STRIDE_BYTES;
 
 pub trait TransformerLayer: Send + Sync {
+    /// Long-context verify of several owners, `rows` rows each, in one
+    /// traversal (`glm_long_owner`). Unsupported layers refuse before any work.
+    fn decode_glm_long_owners(
+        &self,
+        _owners: &mut [super::glm_long_owner::GlmLongOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _stage: &super::glm_long_owner::GlmLongStage,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM long-context owner-batched verify is unsupported for this layer")
+    }
+
+    /// A prefill chunk of `num_tokens` rows at arena rows `[0, num_tokens)`
+    /// that DFlash verify owners ride (`glm_long_owner`): owner `o`'s rows sit
+    /// at `num_tokens + o * rows`. Row-local work runs once over every row;
+    /// each sequence advances only its own state. Unsupported layers refuse
+    /// before any work.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_with_glm_passengers(
+        &self,
+        _hidden: DevicePtr,
+        _num_tokens: usize,
+        _state: &mut dyn LayerState,
+        _seq_len_start: usize,
+        _passengers: &mut [super::glm_long_owner::GlmLongOwner<'_>],
+        _cache: &mut PagedKvCache,
+        _ctx: &ForwardContext<'_>,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("GLM fused prefill + verify is unsupported for this layer")
+    }
+
     /// True when this layer's PREFILL attends only over the tokens it is
     /// handed, so a prefix-cache skip would hide the cached prefix from
     /// attention entirely. MLA layers on the paged path do; everything else
@@ -72,6 +105,26 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// `ATLAS_QWEN4EXP_EXACT_DEFER`: whether this layer's exact verify at
+    /// `num_tokens` rows a sequence runs deferred
+    /// (`layers/ops/qwen4exp_gdn_defer.rs`). Host-side and pure like
+    /// [`Self::gdn_deferred_wyn`], for the same reason. Default: never.
+    fn gdn_exact_defer(
+        &self,
+        _gpu: &dyn spark_runtime::gpu::GpuBackend,
+        _levers: &crate::layers::ops::ModelLevers,
+        _config: &atlas_core::config::ModelConfig,
+        _num_tokens: usize,
+    ) -> bool {
+        false
+    }
+
+    /// The conv1d weight the exact deferred commit replays with. NULL on
+    /// non-GDN layers.
+    fn gdn_conv_weight(&self) -> spark_runtime::gpu::DevicePtr {
+        spark_runtime::gpu::DevicePtr::NULL
+    }
+
     /// `gated_delta_rule_commit` handle for the deferred-commit accept path
     /// (ATLAS_GDN_DEFERRED_COMMIT). KernelHandle(0) on non-GDN layers; the
     /// accept path only consults it when the layer's `gdn_commit_pending`
@@ -89,6 +142,31 @@ pub trait TransformerLayer: Send + Sync {
     /// immediately.
     fn fp8_calibration_frozen(&self) -> Option<bool> {
         None
+    }
+
+    /// Read-only capability check before a KV-only caller mutates scratch or
+    /// temporarily overwrites a reference cache prefix. No GPU work is allowed.
+    fn supports_mla_kv_only(&self) -> bool {
+        false
+    }
+
+    /// Populate only this layer's compressed MLA K/V cache for a batch of
+    /// already-combined MTP inputs. This deliberately skips Q projection,
+    /// attention, output projection, and FFN work: an autoregressive draft
+    /// layer's cached K/V depends only on its normalized input row.
+    ///
+    /// `slots` is a device array of `num_tokens` physical paged-cache slots.
+    /// The default declines the optimization; MLA attention layers override.
+    fn prefill_mla_kv_only(
+        &self,
+        _hidden: DevicePtr,
+        _num_tokens: usize,
+        _kv_cache: &mut PagedKvCache,
+        _slots: DevicePtr,
+        _ctx: &ForwardContext,
+        _stream: u64,
+    ) -> Result<bool> {
+        Ok(false)
     }
 
     /// Hoisted per-step HOST work for layers that do host-side computation
@@ -153,6 +231,33 @@ pub trait TransformerLayer: Send + Sync {
         false
     }
 
+    /// True when [`Self::decode_graph_unsupported`] is an indexer whose only
+    /// step-dependent work, inside its inert bound, is the ingest a staged
+    /// run splits off (`layers/qsa_staged.rs`): the qwen4_exp piecewise
+    /// graphs may then capture this layer on a step whose rows are all
+    /// inert (`ATLAS_QWEN4EXP_DECODE_GRAPH_WIDE=1`).
+    fn qsa_inert_capturable(&self) -> bool {
+        false
+    }
+
+    /// Finish the staged ingest of rows `row..row + count` at positions
+    /// `pos..pos + count` into `state` (the rows' owner) after a staged run;
+    /// `pitched`: as one pitched copy (`QsaIndexer::commit_staged_rows`).
+    /// Only layers that [`Self::qsa_inert_capturable`] stage anything.
+    #[allow(clippy::too_many_arguments)]
+    fn qsa_commit_staged(
+        &self,
+        _state: &mut dyn LayerState,
+        _row: usize,
+        _pos: usize,
+        _count: usize,
+        _pitched: bool,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        anyhow::bail!("qsa_commit_staged on a layer without an indexer")
+    }
+
     /// Marconi aux state: host-serialized per-layer SEQUENCE state that must
     /// travel with an SSM snapshot for a prefix-cache hit to be complete —
     /// PLE's n-gram history + conv state, QSA's ingested indexer keys.
@@ -196,6 +301,28 @@ pub trait TransformerLayer: Send + Sync {
     /// to decline snapshots that lack aux rather than restore a stale mix.
     fn has_aux_state(&self) -> bool {
         false
+    }
+
+    /// Device bytes per token of per-sequence state this layer keeps OUTSIDE
+    /// the paged KV pool and grows with the sequence (the QSA indexer carry).
+    /// The KV budget charges it per pool token, so the pool is sized for the
+    /// state that rides along with its tokens.
+    fn aux_bytes_per_token(&self) -> usize {
+        0
+    }
+
+    /// Grow that state to hold positions `0..tokens`. Called with the block
+    /// reservation, before the forward pass, so running out of memory here is
+    /// an agreed, retryable refusal on every rank (`kv_admission`) instead of
+    /// a mid-forward error on one.
+    fn reserve_aux(
+        &self,
+        _state: &mut dyn LayerState,
+        _tokens: usize,
+        _gpu: &dyn GpuBackend,
+        _stream: u64,
+    ) -> Result<()> {
+        Ok(())
     }
 
     /// Longest visible context at which this layer can serve a BATCHED
@@ -319,6 +446,15 @@ pub trait TransformerLayer: Send + Sync {
     /// `kv_write_start`: number of tokens whose KV cache entries are already
     /// populated (prefix caching). Attention layers skip KV writes for
     /// positions `< kv_write_start`. SSM layers ignore this (recurrent).
+    /// One prefill pass over several sequences' rows (`ATLAS_QWEN4EXP_PREFILL_MULTI`):
+    /// `segs` lie back to back in `hidden` (`total` rows). The row-wise work
+    /// runs once over every row, the per-sequence work (recurrences, PLE,
+    /// attention) per segment, each row's bytes those of its own sequence's
+    /// single-sequence row-invariant prefill. Default: unsupported.
+    fn prefill_multi(&self, pass: &mut MultiPass<'_, '_>) -> Result<()> {
+        super::multi_seg::unsupported(pass)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn prefill(
         &self,

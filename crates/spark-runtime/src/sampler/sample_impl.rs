@@ -64,6 +64,11 @@ pub fn sample_with_params_seeded(
     // monotonic transforms, neither of which can re-order the maximum. Only
     // penalties + logit_bias actually re-order logits, so as long as those
     // ran first, this argmax is correct AND respects caller config.
+    //
+    // Exact ties resolve to the LOWEST index, as on every other greedy pick
+    // in the engine (the GPU `argmax_bf16` kernels and the verify path):
+    // quantized logits tie often, so one rule is what lets a speculative
+    // verify commit exactly the tokens this pick would.
     if params.temperature <= 0.0 {
         // FIRST-index-wins: unifies the tie-break with the GPU argmax kernel
         // (argmax_bf16, lowest-lane), every verify pick (CPU argmax_first_wins,
@@ -102,12 +107,7 @@ pub fn sample_with_params_seeded(
 
     if logits.is_empty() {
         // Fallback: if top-n-sigma filtered everything, use argmax of original
-        return raw_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .map(|(i, _)| i as u32)
-            .unwrap_or(0);
+        return argmax_first_wins_f32(&raw_logits);
     }
 
     // ── 3. Rank-dependent filtering (top-k / min-p / top-p) ──

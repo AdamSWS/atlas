@@ -34,6 +34,13 @@ mod sequence_graphs;
 
 impl TransformerModel {
     pub(super) fn cache_sequence_dispatch(&self, seq: &SequenceState) {
+        // ATLAS_QWEN4EXP_PREFILL_ROWINV: the radix keeps what prefill wrote
+        // (inserted at the prompt's end); generated rows hold decode K/V, not
+        // what a prefill of those tokens computes.
+        if crate::layers::ops::qwen4exp_rowinv::on() {
+            return;
+        }
+        self.finish_leaf_mirror_cache(seq);
         let bs = self.kv_cache.lock().block_size();
         // Only cache if the sequence has block-aligned content worth caching.
         // Sequences shorter than one block have no reusable KV blocks.
@@ -63,6 +70,10 @@ impl TransformerModel {
                 // the next warm hit restores at this turn's END and replays
                 // ~nothing. Save logic + the secondary-stream ordering guard
                 // live in decode_checkpoint.rs (finish_leaf_snapshot).
+                // finish_leaf.rs caches a multi-rank world's sequence, or not at all.
+                if self.finish_cache_multi_rank(seq, bs) {
+                    return;
+                }
                 let finish_snap = self.finish_leaf_snapshot(seq);
                 let acquired = if let Some(snap_id) = finish_snap {
                     let (displaced, acquired) = self.prefix_cache.insert_with_snapshot(
@@ -109,6 +120,9 @@ impl TransformerModel {
     }
 
     pub(super) fn free_sequence_dispatch(&self, seq: &mut SequenceState) -> Result<()> {
+        // A commit left for this sequence's next verify is moot
+        // (`gdn_commit_fuse`); the slot is zeroed below.
+        self.gdn_fuse_drop_slot(seq.slot_idx);
         // Release prefix cache refs before freeing blocks.
         // dec_ref will only actually free blocks whose ref_count hits 0
         // CRITICAL: release SSM slot FIRST to prevent slot leak if later
@@ -152,11 +166,17 @@ impl TransformerModel {
             self.invalidate_slot_graphs(seq.slot_idx);
         }
 
+        self.finish_leaf_release(seq);
         let slot_reused_by_compact = seq.slot_idx >= self.ssm_pool.max_slots;
         let taken = seq.ssm_slot.as_mut().and_then(|g| g.take());
         let slot_to_release = if slot_reused_by_compact { None } else { taken };
         if let Some(slot) = slot_to_release {
             let stream = self.gpu.default_stream();
+            // A verify step that finishes the sequence commits on the secondary
+            // stream and is freed straight away: order the zero after it.
+            if let Err(e) = self.sync_secondary_dispatch() {
+                tracing::error!("free_sequence: sync_secondary before zero_slot({slot}): {e:#}");
+            }
             if let Err(e) = self.ssm_pool.zero_slot(slot, self.gpu.as_ref(), stream) {
                 tracing::error!("free_sequence: ssm_pool.zero_slot({slot}): {e:#}");
             }
@@ -179,23 +199,8 @@ impl TransformerModel {
 
         // Release prefix cache refs before freeing blocks.
         // (i.e., blocks not shared with the prefix cache).
-        //
-        // Normally `seq.tokens` (prompt + generated) fully covers the matched
-        // prefix, so releasing over it undoes the lookup's radix inc_refs. But a
-        // prefill that matched a prefix then FAILED to allocate its suffix never
-        // populated `seq.tokens` (that happens in a later finalize phase), so
-        // `release(&seq.tokens)` would be a no-op and the matched radix nodes
-        // would stay pinned forever → the pool wedges. When `seq.tokens` is too
-        // short to cover the matched prefix, release over the stashed prefix
-        // tokens instead. Exactly one of the two covers the matched nodes, so
-        // they are released once (never double-released).
-        let release_tokens = if seq.tokens.len() >= seq.cached_prefix_tokens {
-            &seq.tokens
-        } else {
-            &seq.prefix_ref_tokens
-        };
         self.prefix_cache.release(
-            release_tokens,
+            self.radix_held_tokens(seq),
             self.kv_cache.lock().block_size(),
             seq.adapter_id,
         );
@@ -238,10 +243,12 @@ impl TransformerModel {
                 ssm.h_state_checkpoint = None;
                 ssm.conv_state_checkpoint = None;
                 ssm.h_state_intermediates.clear();
+                ssm.kda_records = DevicePtr(0);
                 ssm.conv_state_intermediates.clear();
                 ssm.gdn_commit_qkv = DevicePtr(0);
                 ssm.gdn_commit_gb = DevicePtr(0);
                 ssm.gdn_commit_pending = false;
+                ssm.gdn_fuse_n = DevicePtr(0);
             }
         }
 
@@ -373,6 +380,7 @@ impl TransformerModel {
             return Ok(false);
         }
         let stream = self.gpu.default_stream();
+        self.sync_secondary_dispatch()?; // a verify commit may still be folding into old_slot
         self.ssm_pool
             .copy_slot(old_slot, new_slot, self.gpu.as_ref(), stream)
             .inspect_err(|_| self.ssm_pool.release_slot(new_slot))?; // un-claim
@@ -398,6 +406,7 @@ impl TransformerModel {
                     // repoint on rebind like every other pool buffer.
                     ssm.gdn_commit_qkv = self.ssm_pool.commit_qkv(ssm_layer_idx, new_slot);
                     ssm.gdn_commit_gb = self.ssm_pool.commit_gb(ssm_layer_idx, new_slot);
+                    ssm.gdn_fuse_n = self.ssm_pool.fuse_word(new_slot);
                     // Stage-3 f16-SIZED pool: the FP32 prefill staging blob is
                     // per-SLOT, so compaction must repoint it for the same
                     // reason the checkpoint/intermediate families below are
@@ -414,6 +423,9 @@ impl TransformerModel {
                         if ssm.conv_state_checkpoint.is_some() {
                             ssm.conv_state_checkpoint =
                                 Some(self.ssm_pool.conv_checkpoint(ssm_layer_idx, new_slot));
+                        }
+                        if !ssm.kda_records.is_null() {
+                            ssm.kda_records = self.ssm_pool.kda_records(ssm_layer_idx, new_slot);
                         }
                         if !ssm.h_state_intermediates.is_empty() {
                             ssm.h_state_intermediates.clear();
@@ -472,26 +484,6 @@ impl TransformerModel {
         self.ssm_pool.release_slot(old_slot);
         Ok(true)
     }
-
-    pub(super) fn num_free_blocks_dispatch(&self) -> usize {
-        self.kv_cache.lock().num_free_blocks()
-    }
-
-    pub(super) fn num_total_blocks_dispatch(&self) -> usize {
-        self.kv_cache.lock().num_blocks()
-    }
-
-    pub(super) fn reclaim_prefix_blocks_dispatch(&self, num_blocks: usize) -> usize {
-        if num_blocks == 0 || !self.prefix_cache.is_active() {
-            return 0;
-        }
-        let evicted = self.prefix_cache.evict(num_blocks);
-        if evicted.is_empty() {
-            return 0;
-        }
-        let mut kv = self.kv_cache.lock();
-        let before = kv.num_free_blocks();
-        super::super::block_mgmt::apply_evicted_blocks(evicted, &mut kv);
-        kv.num_free_blocks().saturating_sub(before)
-    }
 }
+
+mod block_counts;
