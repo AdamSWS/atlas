@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: AGPL-3.0-only
-
-//! Per-shard fast upload — O_DIRECT + pipelined read/copy, extracted from
-//! `mod.rs` under the 500-LoC cap. See [`load_shard_fast`]'s doc for the
-//! pipeline contract.
-
+//! Single-shard buffered/direct I/O and upload; extracted without changing order.
+use super::{direct_io, header::parse_header};
+use crate::gpu::GpuBackend;
+use crate::weights::{WeightTensor, evict_page_cache, f16_to_bf16_bytes};
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs::File;
 use std::path::Path;
 use std::sync::mpsc::sync_channel;
-
-use anyhow::{Context, Result};
-
-use super::direct_io;
-use super::header::parse_header;
-use crate::gpu::GpuBackend;
-use crate::weights::{WeightTensor, evict_page_cache, f16_to_bf16_bytes};
 
 /// Load a single shard with O_DIRECT + pipelined read/copy.
 ///
@@ -31,6 +24,7 @@ pub(super) fn load_shard_fast(
     tensor_filter: Option<&[String]>,
     gpu: &dyn GpuBackend,
     skip_fn: &dyn Fn(&str) -> bool,
+    defer_fn: &dyn Fn(&str) -> bool,
     try_direct_io: bool,
     direct_io_tensor_cap: usize,
     prefetch_shards: bool,
@@ -60,7 +54,7 @@ pub(super) fn load_shard_fast(
     let mut deferred_here: Vec<(String, crate::weights::DeferredTensor)> = Vec::new();
     #[allow(clippy::items_after_statements)]
     tensors.retain(|t| {
-        if crate::weights::is_ngram_table(&t.name) {
+        if crate::weights::is_ngram_table(&t.name) || (!skip_fn(&t.name) && defer_fn(&t.name)) {
             deferred_here.push((
                 t.name.clone(),
                 crate::weights::DeferredTensor {
@@ -76,7 +70,7 @@ pub(super) fn load_shard_fast(
     });
     if !deferred_here.is_empty() {
         tracing::info!(
-            "Deferred {} n-gram table(s) in {} — served from disk, not uploaded",
+            "Deferred {} tensor(s) in {} — served from disk, not uploaded",
             deferred_here.len(),
             shard_path.display()
         );

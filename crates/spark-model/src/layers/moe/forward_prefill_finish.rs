@@ -17,6 +17,7 @@ impl MoeLayer {
         sorted_token_ids: DevicePtr,
         total_expanded: u32,
         token_to_perm: DevicePtr,
+        indices_dev: DevicePtr,
         weights_dev: DevicePtr,
         h: u32,
         n: u32,
@@ -24,6 +25,12 @@ impl MoeLayer {
         num_tokens: usize,
         has_shared: bool,
         use_overlap: bool,
+        sp: Option<crate::layers::glm_sp::SpRows>,
+        split: bool,
+        overlap_shared_reduce: bool,
+        shared_in: DevicePtr,
+        shared_n: u32,
+        defer_shared_hc: bool,
         ctx: &ForwardContext,
         stream: u64,
     ) -> Result<()> {
@@ -60,18 +67,52 @@ impl MoeLayer {
 
         // 7. Unpermute + weighted reduce: scatter sorted outputs to token order
         let output = ctx.buffers.moe_output();
-        ops::moe_unpermute_reduce_indexed(
-            ctx.gpu,
-            self.moe_unpermute_reduce,
-            expert_down_out,
-            output,
-            token_to_perm,
-            weights_dev,
-            h,
-            n,
-            top_k,
-            stream,
-        )?;
+        // ATLAS_QWEN4EXP_PREFILL_SP_RS_PIPE: under SP, the unpermute of the
+        // rows the peer needs first, their reduce-scatter on the wire while
+        // the rest unpermute (`layers::qwen4exp_sp_pipe`).
+        // With `_SP_SHARED`, the shared expert runs on the wire too (it was
+        // deferred by `forward_prefill`, `defer_shared_to_rs`).
+        let defer_shared =
+            !split && self.defer_shared_to_rs(sp, has_shared, overlap_shared_reduce, h, ctx);
+        let shared_inter = ctx.config.shared_expert_intermediate_size as u32;
+        let run_shared = |s: u64| {
+            self.run_shared_expert_prefill(shared_in, shared_n, h, shared_inter, s, s, false, ctx)
+        };
+        let rs_done = match sp {
+            Some(sp) if !split && !overlap_shared_reduce && !use_overlap => self
+                .q38_unpermute_reduce_scatter(
+                    sp,
+                    [
+                        expert_down_out,
+                        output,
+                        token_to_perm,
+                        indices_dev,
+                        weights_dev,
+                    ],
+                    [h, top_k],
+                    ctx,
+                    stream,
+                    |s| if defer_shared { run_shared(s) } else { Ok(()) },
+                )?,
+            _ => false,
+        };
+        if defer_shared && !rs_done {
+            run_shared(stream)?;
+        }
+        let blended = !rs_done
+            && self.unpermute_ep_prefill(
+                expert_down_out,
+                output,
+                token_to_perm,
+                indices_dev,
+                weights_dev,
+                h,
+                n,
+                top_k,
+                split.then_some(input),
+                ctx,
+                stream,
+            )?;
 
         // 8. Blend shared expert: output += sigmoid(dot(input, gate)) * shared
         // Skip when has_shared == false (no shared expert in this model config).
@@ -107,6 +148,44 @@ impl MoeLayer {
         super::dump::dump_moe_out(ctx.gpu, stream, output, n, h)?;
         prof_step!("unpermute_blend");
 
+        // The routed result is now complete. Starting the shared expert here
+        // lets its GEMMs run beside the EP collective instead of beside the
+        // bandwidth-heavy routed GEMMs. event_a makes the auxiliary stream wait
+        // for this point; event_b is joined immediately before the shared blend.
+        if overlap_shared_reduce {
+            self.run_shared_expert_prefill(
+                shared_in,
+                shared_n,
+                h,
+                ctx.config.shared_expert_intermediate_size as u32,
+                self.prefill_stream,
+                stream,
+                true,
+                ctx,
+            )?;
+        }
+
+        // `ATLAS_GLM_SHARED_TP_SPLIT=1`: each rank already blended its partial
+        // shared-expert columns before this point (see forward_prefill).
+        if split && !blended {
+            ops::moe_batched_blend(
+                ctx.gpu,
+                self.moe_batched_blend,
+                output,
+                ctx.buffers.attn_output(),
+                input,
+                self.weights.shared_expert_gate.weight,
+                h,
+                n,
+                stream,
+            )?;
+        }
+
+        // ATLAS_GLM_DET_TRACE stages (`det_rows`: the rows the reduce leaves here).
+        let det = crate::det_trace::on_stream(ctx.gpu, stream);
+        let det_rows = sp.map_or((0, num_tokens), |sp| (sp.row0, sp.rows));
+        let row = h as usize * 2;
+        det.tap("moe_local", output, (0, num_tokens), row);
         // EP all-reduce
         if let Some(comm) = ctx.comm
             && ctx.config.ep_world_size > 1
@@ -117,7 +196,11 @@ impl MoeLayer {
             } else {
                 None
             };
-            if ctx.graph_capture {
+            if rs_done {
+                // Reduce-scattered with the unpermute above.
+            } else if let Some(sp) = sp {
+                sp.reduce_scatter(output, h as usize, ctx, stream)?;
+            } else if ctx.graph_capture {
                 comm.all_reduce(output.0, num_tokens * h as usize * 2)?;
             } else {
                 comm.all_reduce_async(output.0, num_tokens * h as usize * 2, stream)?;
@@ -130,23 +213,36 @@ impl MoeLayer {
                     t0.elapsed().as_micros(),
                 );
             }
+            let reduced = sp.map_or(output, |sp| sp.local(output, h as usize));
+            det.tap("moe_red", reduced, det_rows, row);
             // Add shared expert ONCE after all-reduce (prevents EP doubling)
-            if has_shared {
-                let shared_down_out = ctx.buffers.attn_output();
-                if use_overlap {
+            if has_shared && !defer_shared_hc && !split {
+                // A `full_shared` split ran the shared expert over every row;
+                // the blend takes this rank's rows of it.
+                let (shared_down_out, shared_in, shared_n) = match sp {
+                    Some(sp) if sp.full_shared => (
+                        sp.local(ctx.buffers.attn_output(), h as usize),
+                        sp.local(input, h as usize),
+                        sp.rows as u32,
+                    ),
+                    _ => (ctx.buffers.attn_output(), shared_in, shared_n),
+                };
+                if use_overlap || overlap_shared_reduce {
                     ctx.gpu.stream_wait_event(stream, self.event_b)?;
                 }
+                det.tap("moe_sh", shared_down_out, det_rows, row);
                 ops::moe_batched_blend(
                     ctx.gpu,
                     self.moe_batched_blend,
-                    output,
+                    reduced,
                     shared_down_out,
-                    input,
+                    shared_in,
                     self.weights.shared_expert_gate.weight,
                     h,
-                    n,
+                    shared_n,
                     stream,
                 )?;
+                det.tap("moe", reduced, det_rows, row);
             }
         }
 

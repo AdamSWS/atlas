@@ -20,4 +20,5 @@ mod harness;
 mod health_fault;
 mod model_advertise;
 mod sanitizer;
+mod sanitizer_prefix;
 mod watchdog;

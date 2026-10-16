@@ -63,7 +63,9 @@ impl TransformerModel {
         // and is deliberately NOT made here; it needs its own measured A/B.
         let on_interval = self.ssm_checkpoint_interval > 0
             && end_block.is_multiple_of(self.ssm_checkpoint_interval);
-        if end_block == 0 || !(is_prompt_tail || on_interval) {
+        // ATLAS_GLM_PC_BRANCH: the planned branch checkpoint (`pc_policy`).
+        let is_branch = seq.pc_branch_at == Some(end_token);
+        if end_block == 0 || !(is_prompt_tail || on_interval || is_branch) {
             return Ok(());
         }
         // Stale-V cap (mirrors finalize_last): never checkpoint-cache a block
@@ -88,6 +90,9 @@ impl TransformerModel {
             );
         }
 
+        // ATLAS_GLM_PC_FINISH_LEAF: the slot may have been a finish leaf a
+        // moment ago, with its copy still in flight on another stream.
+        self.finish_leaf_wait_copies(stream)?;
         let snap_result = match self.ssm_snapshots.save(
             seq.slot_idx,
             seq.session_hash,
@@ -134,6 +139,7 @@ impl TransformerModel {
         let Some(snap_id) = snap_result else {
             return Ok(());
         };
+        self.finish_leaf_record_copy(stream)?;
         // Aux (PLE n-gram history/conv + QSA indexer keys) rides the
         // checkpoint. This boundary is a completed pass end, so the lexical
         // state is position-correct at `end_token` by construction. Without
@@ -142,11 +148,44 @@ impl TransformerModel {
         // warm multi-turn matches land on, so an aux-carrying model would
         // recompute every warm prefill from zero.
         let mut aux = self.ssm_snapshots.take_aux(snap_id);
-        self.collect_aux_states_into(seq, stream, &mut aux)?;
+        // ATLAS_QWEN4EXP_CKPT_AUX_SHARE: the mid-chunk finalize read these.
+        if !super::qwen4exp_ckpt::take_pass_aux(seq.slot_idx, seq.seq_len, &mut aux) {
+            self.collect_aux_states_into(seq, stream, &mut aux)?;
+        }
         if !aux.is_empty() {
             self.ssm_snapshots.set_aux(snap_id, aux);
         }
 
+        if !self
+            .register_intermediate_checkpoint(tokens, seq, kv_cache, end_token, snap_id, is_branch)
+        {
+            return Ok(());
+        }
+        tracing::info!(
+            "Intermediate SSM checkpoint saved at token {} (snapshot_id {}, block {})",
+            end_token,
+            snap_id,
+            end_block,
+        );
+        Ok(())
+    }
+
+    /// Index `snap_id` (SSM state + aux at `end_token`) as the intermediate
+    /// checkpoint of `tokens[..end_token]`, with the prefix-cache blocks
+    /// under it. `false` (snapshot freed): the boundary cannot be cached
+    /// (the KV is not valid that far, the sliding window has begun, or the
+    /// prefix holds a vision placeholder).
+    pub(in crate::model) fn register_intermediate_checkpoint(
+        &self,
+        tokens: &[u32],
+        seq: &SequenceState,
+        kv_cache: &mut PagedKvCache,
+        end_token: usize,
+        snap_id: usize,
+        is_branch: bool,
+    ) -> bool {
+        let bs = kv_cache.block_size();
+        let end_block = end_token / bs;
         let boundary_tokens = &tokens[..end_token];
         // Phase 6.3 sliding-window: when HSS is engaged AND sliding has begun
         // (hss_window_start > 0), the front of the prefix is no longer
@@ -156,7 +195,7 @@ impl TransformerModel {
         let skip_boundary_insert = seq.hss_window_start() > 0 || end_block > seq.block_table.len();
         if skip_boundary_insert {
             self.ssm_snapshots.free(snap_id);
-            return Ok(());
+            return false;
         }
         let boundary_blocks = &seq.block_table[..end_block];
         // Vision chunks: skip both the radix insert and the SSM snapshot
@@ -165,7 +204,7 @@ impl TransformerModel {
         // prior image's state.
         if self.tokens_have_vision_pad(boundary_tokens) {
             self.ssm_snapshots.free(snap_id);
-            return Ok(());
+            return false;
         }
         let boundary_disk = if seq.disk_block_ids.len() >= end_block {
             &seq.disk_block_ids[..end_block]
@@ -200,12 +239,10 @@ impl TransformerModel {
         ) {
             self.ssm_snapshots.free(old);
         }
-        tracing::info!(
-            "Intermediate SSM checkpoint saved at token {} (snapshot_id {}, block {})",
-            end_token,
-            snap_id,
-            end_block,
-        );
-        Ok(())
+        if is_branch {
+            self.prefix_cache
+                .mark_branch_snapshot(boundary_tokens, seq.adapter_id);
+        }
+        true
     }
 }

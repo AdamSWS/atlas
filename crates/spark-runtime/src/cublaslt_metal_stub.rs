@@ -23,6 +23,12 @@ pub const DENSE_GEMV_BATCHM_MAX_M: u32 = 8;
 pub const DENSE_GEMV_BATCHM_OUTPUTS_PER_BLOCK: u32 = 4;
 pub const DENSE_GEMV_BATCHM_THREADS: u32 = 256;
 
+/// The real `version()` reads the linked libcublasLt; under the stub there
+/// is none, and 0 says so.
+pub fn version() -> usize {
+    0
+}
+
 pub fn install_bf16_fallback(_f: Box<Bf16GemmFallback>) -> bool {
     unreachable!("cublaslt::install_bf16_fallback is cuda-only (not built for metal)")
 }
@@ -45,6 +51,18 @@ pub fn bf16_gemm_act_weight_t(
     _stream: u64,
 ) -> Result<()> {
     unreachable!("cublaslt::bf16_gemm_act_weight_t is cuda-only (not built for metal)")
+}
+
+pub fn tf32_gemm_act_weight_t(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _stream: u64,
+) -> Result<()> {
+    unreachable!("cublaslt::tf32_gemm_act_weight_t is cuda-only (not built for metal)")
 }
 
 pub fn fp8_gemm_act_weight_t_rowwise(
@@ -73,4 +91,35 @@ pub fn fp8_gemm_act_weight_t_blkscaled(
     _stream: u64,
 ) -> Result<()> {
     unreachable!("cublaslt::fp8_gemm_act_weight_t_blkscaled is cuda-only (not built for metal)")
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn bf16_grouped_gemm_act_weight_t(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _g: u32,
+    _n: u32,
+    _k: u32,
+    _a_stride: u32,
+    _c_stride: u32,
+    _stream: u64,
+) -> Result<()> {
+    anyhow::bail!("cublaslt::bf16_grouped_gemm_act_weight_t requires CUDA")
+}
+
+/// No CUDA FP8 library on Metal; the opt-in caller fails explicitly.
+#[allow(clippy::too_many_arguments)]
+pub fn fp8_gemm_act_weight_t_tensorwise(
+    _act: u64,
+    _weight: u64,
+    _out: u64,
+    _m: u32,
+    _n: u32,
+    _k: u32,
+    _no_split_k: bool,
+    _stream: u64,
+) -> anyhow::Result<()> {
+    anyhow::bail!("cuBLASLt tensorwise FP8 requires CUDA")
 }

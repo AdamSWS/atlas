@@ -10,11 +10,17 @@ use super::*;
 use crate::api::InferenceRequest;
 use crate::grammar::GrammarEngine;
 
+mod initial_budget;
+mod queue_order;
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start_new_requests(
     model: &dyn Model,
     sched: &crate::scheduler::sched_ctx::SchedCtx,
     new_reqs: Vec<InferenceRequest>,
+    // Per request: the checkpoint its prefill plants for requests that share
+    // its prefix (`shared_prefix`).
+    pc_plants: Vec<Option<usize>>,
     chunked: bool,
     always_mixed: bool,
     max_prefill_tokens: usize,
@@ -31,6 +37,19 @@ pub(super) fn start_new_requests(
     active: &mut Vec<ActiveSeq>,
     prefilling: &mut Vec<PrefillInProgress>,
 ) {
+    // Buffered disconnect: `stream: false` callers that aborted the HTTP
+    // request have no receiver left, so admitting them would burn GPU
+    // prefill/decode for an unobservable response. Drop them before any
+    // model work (including the vision/beam co-dispatch pre-passes below).
+    // Streaming cancellation stays on `cancel_flag` and is untouched.
+    let (new_reqs, pc_plants): (Vec<InferenceRequest>, Vec<Option<usize>>) = new_reqs
+        .into_iter()
+        .zip(pc_plants)
+        .filter(|(req, _)| !req.caller_gone())
+        .unzip();
+    if new_reqs.is_empty() {
+        return;
+    }
     // Co-dispatch (ATLAS_PREFILL_CODISPATCH=1): when >=2 non-vision requests are
     // co-admitted this tick with no active decode to starve, DEFER their chunk-0
     // prefill so they batch into one forward via run_batched_prefill_step (which
@@ -231,11 +250,29 @@ pub(super) fn start_new_requests(
         }
     }
 
-    for (req_idx, req) in new_reqs.into_iter().enumerate() {
+    // ATLAS_QWEN4EXP_PREFILL_MULTI: defer the short prompts of a burst (two
+    // or more this tick, or some already waiting) to one multi-sequence pass.
+    let multi_eligible = |req: &InferenceRequest| {
+        chunked
+            && !req.has_image_pixels()
+            && req.num_beams() <= 1
+            && super::prefill_multi::eligible(
+                model,
+                req.prompt_len(),
+                req.prompt_len() <= max_prefill_tokens,
+                req.prompt_logprobs().is_some(),
+                req.adapter_slot(),
+            )
+    };
+    let multi_burst = new_reqs.iter().filter(|r| multi_eligible(r)).count() >= 2
+        || super::prefill_multi::pending(model, prefilling);
+
+    for (req_idx, (req, pc_plant)) in new_reqs.into_iter().zip(pc_plants).enumerate() {
         let precomputed_beam_hyp = beam_hyps[req_idx].take();
         if chunked {
-            let defer =
-                want_codispatch || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels());
+            let defer = want_codispatch
+                || ((mixed_defer || want_varlen_defer) && !req.has_image_pixels())
+                || (multi_burst && multi_eligible(&req));
             // Pre-encoded by the co-dispatch pre-pass? (num_images>0 ⇒ batched)
             let slice = vision_slices[req_idx];
             let vision_slice = if slice.num_images > 0 {
@@ -246,11 +283,17 @@ pub(super) fn start_new_requests(
             // When no active sequences are decoding, process as much of the
             // prompt as buffers allow — avoids per-token paged decode fallback
             // in chunk 2+. Capped at max_batch_tokens (buffer capacity).
-            let budget = if active.is_empty() && prefilling.is_empty() {
-                max_batch_tokens
-            } else {
-                max_prefill_tokens
-            };
+            // The actual chunked-MLA implementation currently identifies the
+            // GLM semantic-index path; the C4 sparse selector is an additional
+            // opt-in, not inferred from arena size or request concurrency.
+            let glm_c4_sparse = model.supports_chunked_mla()
+                && spark_model::model::glm_c4::sparse_enabled("glm5_next");
+            let budget = initial_budget::initial_chunk_budget(
+                max_prefill_tokens,
+                max_batch_tokens,
+                active.is_empty() && prefilling.is_empty(),
+                glm_c4_sparse,
+            );
             match start_chunked_prefill(
                 sched,
                 think_end_token,
@@ -268,6 +311,7 @@ pub(super) fn start_new_requests(
                 defer,
                 vision_slice,
                 precomputed_beam_hyp,
+                pc_plant,
             ) {
                 Ok(StartPrefillResult::Active(a)) => {
                     tracing::info!(
@@ -284,7 +328,16 @@ pub(super) fn start_new_requests(
                         p.chunk_offset,
                         p.prompt_tokens.len(),
                     );
-                    prefilling.push(p);
+                    let queued: Vec<_> = prefilling
+                        .iter()
+                        .map(|q| {
+                            let left = q.prompt_tokens.len() - q.chunk_offset;
+                            (left, q.request_start.elapsed())
+                        })
+                        .collect();
+                    let left = p.prompt_tokens.len() - p.chunk_offset;
+                    let at = queue_order::position(&queued, left, sched.levers.prefill_srpt);
+                    prefilling.insert(at, p);
                 }
                 Ok(StartPrefillResult::Finished) => {} // EOS on first token
                 Err(e) => {

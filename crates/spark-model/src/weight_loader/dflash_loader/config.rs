@@ -4,6 +4,7 @@
 //! the 500-LoC file budget — the serde surface mirrors the checkpoints'
 //! field names verbatim so `serde_json::from_str` works on the raw file.
 
+use anyhow::{Context, Result};
 use serde::Deserialize;
 
 /// Drafter HF `config.json` (subset Atlas consumes). Mirrors
@@ -64,14 +65,45 @@ pub struct DflashConfig {
     /// DSpark Markov rank. `None` / 0 = DFlash-only (no sequential fixup).
     #[serde(default)]
     pub markov_rank: Option<usize>,
+    /// Drafter RMSNorm epsilon (Qwen3 default 1e-6; GLM-5.3's DFlash2 ships 1e-5).
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f32,
+    /// transformers-5 `rope_parameters`. Folded into `rope_theta` /
+    /// `rope_scaling` by [`parse_dflash_config`] when those root keys are absent.
+    #[serde(default)]
+    pub rope_parameters: Option<DflashRopeParameters>,
+    /// HF `is_causal`; wins over `dflash_config.causal` (see [`Self::query_causal`]).
+    #[serde(default)]
+    pub is_causal: Option<bool>,
+    /// HF sliding-window keys, read by [`Self::sliding_window`].
+    #[serde(default)]
+    pub use_sliding_window: Option<bool>,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
     /// NVIDIA LiLiCorr drafters ship their own `lm_head` (`Some(true)`);
     /// generic DFlash drafters omit the key and share the target's head.
-    #[serde(default)]
     pub has_own_lm_head: Option<bool>,
 }
 
 fn default_rope_theta() -> f32 {
     10_000_000.0
+}
+
+fn default_rms_norm_eps() -> f32 {
+    1e-6
+}
+
+/// transformers-5 `rope_parameters`: `rope_theta` plus the scaling fields
+/// older configs carried in `rope_scaling` (`incoai/GLM-5.3-Flash-DFlash2`
+/// ships its theta only here).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DflashRopeParameters {
+    #[serde(default)]
+    pub rope_theta: Option<f32>,
+    #[serde(flatten)]
+    pub scaling: DflashRopeScaling,
 }
 
 /// Subset of HF `rope_scaling` block consumed by Atlas. Mirrors the field
@@ -173,4 +205,65 @@ impl DflashConfig {
             .map(|a| a.iter().any(|name| name == "DFlash2DraftModel"))
             .unwrap_or(false)
     }
+
+    /// Causal γ-block attention: HF `is_causal` wins over
+    /// `dflash_config.causal`; both absent ⇒ bidirectional.
+    pub fn query_causal(&self) -> bool {
+        self.is_causal
+            .or_else(|| self.dflash_config.as_ref().and_then(|c| c.causal))
+            .unwrap_or(false)
+    }
+
+    /// Checkpoint sliding window: `dflash_config.swa_window_size`, else the HF
+    /// `sliding_window` when `use_sliding_window` (or `dflash_config.use_swa`)
+    /// is set or every `layer_types` entry is `sliding_attention`.
+    pub fn sliding_window(&self) -> Option<usize> {
+        let sub = self.dflash_config.as_ref();
+        if let Some(window) = sub.and_then(|c| c.swa_window_size) {
+            return Some(window);
+        }
+        let all_sliding = self
+            .layer_types
+            .as_ref()
+            .is_some_and(|t| !t.is_empty() && t.iter().all(|t| t == "sliding_attention"));
+        let sliding = self.use_sliding_window == Some(true)
+            || sub.and_then(|c| c.use_swa) == Some(true)
+            || all_sliding;
+        if sliding { self.sliding_window } else { None }
+    }
+}
+
+/// Parse a DFlash drafter's `config.json` into a [`DflashConfig`]. Used by
+/// `main.rs` after fetching the drafter's HF metadata to size the runtime
+/// `BlockDiffusionDraftHead` (layer count, head_dim, vocab_size, the
+/// `target_layer_ids` capture indices).
+///
+/// transformers-5 checkpoints may carry the rope settings ONLY in
+/// `rope_parameters` (folded in when the root keys are absent), and DFlash2
+/// nests `block_size` in `dflash_config` (folded with the precedence of
+/// [`DflashConfig::block_size`]), so every consumer of `rope_theta` /
+/// `block_size` sees the checkpoint's values instead of the Qwen3.6 defaults.
+pub fn parse_dflash_config(json: &str) -> Result<DflashConfig> {
+    let raw: serde_json::Value =
+        serde_json::from_str(json).context("Parsing DFlash drafter config.json")?;
+    let mut config: DflashConfig =
+        serde_json::from_value(raw.clone()).context("Parsing DFlash drafter config.json")?;
+    if let Some(params) = config.rope_parameters.clone() {
+        if raw.get("rope_theta").is_none()
+            && let Some(theta) = params.rope_theta
+        {
+            config.rope_theta = theta;
+        }
+        let scaled = params
+            .scaling
+            .rope_type
+            .as_deref()
+            .is_some_and(|t| t != "default");
+        if config.rope_scaling.is_none() && scaled {
+            config.rope_scaling = Some(params.scaling);
+        }
+    }
+    // Same precedence as [`DflashConfig::block_size`]: the nested value wins.
+    config.block_size = config.block_size();
+    Ok(config)
 }

@@ -15,6 +15,10 @@ use std::collections::HashMap;
 use crate::tool_parser;
 
 pub(super) struct StreamState {
+    /// Total sampled completion tokens, including reasoning tokens. Unlike
+    /// `all_toks`, this counter is not reset at the `</think>` boundary, so
+    /// request-level `min_tokens` applies to the complete generation.
+    pub(super) generated_tokens: usize,
     /// Token IDs accumulated since the last reset (cleared at the
     /// `</think>` boundary so post-thinking content decodes cleanly).
     pub(super) all_toks: Vec<u32>,
@@ -172,10 +176,9 @@ pub(super) struct StreamState {
     /// True iff the reasoning/`<think>` phase has finished. Starts
     /// `true` when the request did not enable thinking.
     pub(super) thinking_done: bool,
-    /// Dead after the tool-call retry stack was removed (`tool_retry_enabled`
-    /// is now constant `false`, so deltas are always streamed in real time
-    /// and this map stays empty). Retained so the buffering helpers in
-    /// `tool_handlers.rs` still type-check.
+    /// A tool call's deltas held until the call validates, by index: for
+    /// Poolside v1 streams (`tool_handlers::holds_tool_deltas`). Anything
+    /// still held when the stream ends is dropped, never sent.
     pub(super) buffered_tool_chunks: std::collections::HashMap<usize, Vec<crate::ir::StreamDelta>>,
     /// Dead after the tool-call retry stack was removed; never set now that
     /// `tool_retry_enabled` is constant `false`.
@@ -205,6 +208,7 @@ impl StreamState {
         tool_defs: Vec<tool_parser::ToolDefinition>,
     ) -> Self {
         Self {
+            generated_tokens: 0,
             all_toks: Vec::new(),
             emitted: 0,
             content_decoded: String::new(),

@@ -472,10 +472,12 @@ impl TransformerLayer for NemotronMamba2Layer {
             h_state_checkpoint: None,
             conv_state_checkpoint: None,
             h_state_intermediates: Vec::new(),
+            kda_records: spark_runtime::gpu::DevicePtr::NULL,
             conv_state_intermediates: Vec::new(),
             gdn_commit_qkv: DevicePtr(0),
             gdn_commit_gb: DevicePtr(0),
             gdn_commit_pending: false,
+            gdn_fuse_n: DevicePtr::NULL,
             h_is_f16: false,
             // Stage-3 narrowing is GDN-only (`ssm_h_fp16_preconditions`
             // refuses a non-GDN SSM stack), so this state is always FP32-wide.

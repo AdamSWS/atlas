@@ -164,6 +164,34 @@ pub(super) fn penalty_params_for(
     seed: Option<u64>,
     base_logit_bias: Vec<(u32, f32)>,
 ) -> SamplingParams {
+    penalty_params_for_with_floor(
+        a,
+        kind,
+        temperature,
+        seed,
+        base_logit_bias,
+        min_reasoning_floor(),
+    )
+}
+
+/// The params of a verify or bootstrap position: plain decode's at
+/// temperature 0, the request's `logit_bias` included (verify used to drop
+/// it, so a biased request picked differently speculating than decoding).
+pub(super) fn verify_penalty_params(a: &ActiveSeq) -> SamplingParams {
+    penalty_params_for(a, PositionKind::Verify, 0.0, None, a.logit_bias.clone())
+}
+
+/// Shared parameter construction with the already-resolved model floor.
+/// The production wrapper reads its existing boot-installed value; tests can
+/// exercise another model's policy without changing that process-wide value.
+pub(super) fn penalty_params_for_with_floor(
+    a: &ActiveSeq,
+    kind: PositionKind,
+    temperature: f32,
+    seed: Option<u64>,
+    base_logit_bias: Vec<(u32, f32)>,
+    floor: u32,
+) -> SamplingParams {
     // `Verify` positions are a penalty-aware greedy ARGMAX, so the contract
     // is temperature 0.0, no seed. The base bias is the sequence's own
     // (a.logit_bias — must match FinalDecode at the same position). Pin it so
@@ -207,7 +235,6 @@ pub(super) fn penalty_params_for(
     // <|im_end|>/<|im_start|> and sampled runs EOS inside think (empty
     // body) or simulate new template turns (measured on qwen4_exp,
     // 2026-08-26, via ATLAS_LOGIT_DUMP).
-    let floor = min_reasoning_floor();
     if floor > 0
         && a.inside_thinking
         && a.thinking_tokens < floor
@@ -603,7 +630,9 @@ pub fn sample_first_token(
     grammar_state: Option<&mut GrammarState>,
     levers: &crate::scheduler::logit_processors::SamplingLevers,
 ) -> Result<u32> {
-    let Some(gs) = grammar_state else {
+    // A strict grammar whose response opens inside `<think>` starts after
+    // `</think>`: this token is reasoning (GrammarState::masks_first_token).
+    let Some(gs) = grammar_state.filter(|gs| gs.masks_first_token()) else {
         return sample_token(
             model,
             logits,
@@ -649,11 +678,14 @@ pub fn sample_first_token(
         &[],
         levers,
     )?;
-    // Advance the matcher past the first token (the emit_step accept_token
-    // only runs for tokens 2..N). A grammar-disallowed first token here would
-    // indicate the mask was not applied — keep going rather than abort; the
-    // emit_step disengage path handles any later desync gracefully.
-    gs.accept_token(tok);
+    // Advance the matcher past the first token (emit_step and the decode loop
+    // accept tokens 2..N). The mask makes a refusal impossible unless it was
+    // bypassed: a strict (response_format) grammar then fails the request like
+    // every other strict refusal; a tool grammar keeps going and the emit-path
+    // disengage handles any later desync.
+    if !gs.accept_token(tok) && gs.is_strict() {
+        anyhow::bail!(crate::scheduler::emit_step::strict_refusal(tok, 0));
+    }
     Ok(tok)
 }
 

@@ -187,6 +187,8 @@ pub fn parse_nemotron_h_omni(raw: &serde_json::Value) -> Result<ModelConfig> {
         };
         let merge = (1.0 / top("downsample_ratio").max(1e-9)).round() as usize;
         config.vision = Some(crate::config::VisionConfig {
+            is_glm5_next: false,
+            in_channels: 3,
             depth: g("num_hidden_layers"),
             hidden_size: g("hidden_size"),
             num_heads: g("num_attention_heads"),
@@ -199,11 +201,18 @@ pub fn parse_nemotron_h_omni(raw: &serde_json::Value) -> Result<ModelConfig> {
                     .unwrap_or(4.0)) as usize,
             out_hidden_size: config.hidden_size,
             deepstack_visual_indexes: vec![],
+            projection_intermediate_size: 0,
+            rms_norm_eps: 1e-6,
+            swiglu_limit: 0.0,
             image_pad_token_id: raw
                 .get("img_context_token_id")
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(18) as u32,
             video_pad_token_id: 0,
+            image_start_token_id: 0,
+            image_end_token_id: 0,
+            video_start_token_id: 0,
+            video_end_token_id: 0,
             max_pixels: None,
             omni: Some(crate::config::OmniVisionConfig {
                 norm_mean: g3("norm_mean"),

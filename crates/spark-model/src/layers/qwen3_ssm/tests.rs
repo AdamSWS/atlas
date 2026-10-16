@@ -116,12 +116,14 @@ fn mk_state(gpu: &MockGpuBackend, layer: &Qwen3SsmLayer, n_inter: usize) -> SsmL
         h_state_checkpoint: None,
         conv_state_checkpoint: None,
         h_state_intermediates: (0..n_inter).map(|i| h_slab.offset(i * h_bytes)).collect(),
+        kda_records: spark_runtime::gpu::DevicePtr::NULL,
         conv_state_intermediates: (0..n_inter)
             .map(|i| conv_slab.offset(i * conv_bytes))
             .collect(),
         gdn_commit_qkv: DevicePtr(0),
         gdn_commit_gb: DevicePtr(0),
         gdn_commit_pending: false,
+        gdn_fuse_n: DevicePtr::NULL,
         h_is_f16: false,
         h_prefill_stage: None,
         ple: None,
@@ -142,6 +144,7 @@ fn run_batched_verify(
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let ctx = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,
@@ -295,12 +298,14 @@ fn active_row_without_ple_carry_is_refused() {
     layer.set_hc_weights(crate::layers::qwen3_attention::HcWeights {
         attn: crate::layers::qwen3_attention::HcSiteWeights {
             hc_fn: DevicePtr::NULL,
+            hc_fn_bf16: DevicePtr::NULL,
             hc_base: DevicePtr::NULL,
             hc_scale: DevicePtr::NULL,
             lowrank: None,
         },
         ffn: crate::layers::qwen3_attention::HcSiteWeights {
             hc_fn: DevicePtr::NULL,
+            hc_fn_bf16: DevicePtr::NULL,
             hc_base: DevicePtr::NULL,
             hc_scale: DevicePtr::NULL,
             lowrank: None,
@@ -369,6 +374,7 @@ fn active_row_without_ple_carry_is_refused() {
         gdn_exact_replay: false,
         token_ids: None,
         host_token_ids: Some(&[42]),
+        ssm_batch: None,
         routed_lora_layers: None,
         midchunk_capture: None,
         moe_lora_route: crate::layer::MoeLoraRoute::Fold,
@@ -526,6 +532,7 @@ fn single_verify_k4_d2d(
     let levers = crate::layers::ops::ModelLevers::defaults();
     let stats = crate::layers::ops::ModelStats::new();
     let ctx = ForwardContext {
+        ssm_batch: None,
         dispatch: &dispatch,
         derived: &derived,
         levers: &levers,
